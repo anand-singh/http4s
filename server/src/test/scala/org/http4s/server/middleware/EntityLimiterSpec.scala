@@ -2,52 +2,57 @@ package org.http4s
 package server
 package middleware
 
+import cats.effect._
+import cats.implicits._
+import fs2._
+import fs2.Stream._
 import java.nio.charset.StandardCharsets
-
 import org.http4s.server.middleware.EntityLimiter.EntityTooLarge
-import org.specs2.mutable.Specification
-import scodec.bits.ByteVector
-import scalaz.stream.Process.emit
-import Method._
-import Status._
+import org.http4s.Method._
+import org.http4s.Status._
+import org.http4s.Uri.uri
 
-class EntityLimiterSpec extends Specification {
-  import Http4s._
+class EntityLimiterSpec extends Http4sSpec {
 
-  val s = HttpService {
-    case r: Request if r.uri.path == "/echo" => r.decode[String](Response(Ok).withBody)
+  val routes = HttpRoutes.of[IO] {
+    case r if r.uri.path == "/echo" => r.decode[String](Response[IO](Ok).withEntity(_).pure[IO])
   }
 
-  val b = emit(ByteVector.view("hello".getBytes(StandardCharsets.UTF_8)))
+  val b = chunk(Chunk.bytes("hello".getBytes(StandardCharsets.UTF_8)))
 
   "EntityLimiter" should {
 
     "Allow reasonable entities" in {
-      EntityLimiter(s, 100).apply(Request(POST, uri("/echo"), body = b))
+      EntityLimiter(routes, 100)
+        .apply(Request[IO](POST, uri("/echo"), body = b))
         .map(_ => -1)
-        .run must be_==(-1)
+        .value must returnValue(Some(-1))
     }
 
     "Limit the maximum size of an EntityBody" in {
-      EntityLimiter(s, 3).apply(Request(POST, uri("/echo"), body = b))
-        .map(_ => -1)
-        .handle { case EntityTooLarge(i) => i }
-        .run must be_==(3)
+      EntityLimiter(routes, 3)
+        .apply(Request[IO](POST, uri("/echo"), body = b))
+        .map(_ => -1L)
+        .value
+        .handleError { case EntityTooLarge(i) => Some(i) } must returnValue(Some(3))
     }
 
-    "Chain correctly with other HttpServices" in {
-      val s2 = HttpService {
-        case r: Request if r.uri.path == "/echo2" => r.decode[String](Response(Ok).withBody)
+    "Chain correctly with other HttpRoutes" in {
+      val routes2 = HttpRoutes.of[IO] {
+        case r if r.uri.path == "/echo2" =>
+          r.decode[String](Response[IO](Ok).withEntity(_).pure[IO])
       }
 
-      val st = EntityLimiter(s, 3)
-      (st.apply(Request(POST, uri("/echo2"), body = b))
+      val st = EntityLimiter(routes, 3) <+> routes2
+
+      st.apply(Request[IO](POST, uri("/echo2"), body = b))
         .map(_ => -1)
-        .run must be_==(-1)) &&
-        (st.apply(Request(POST, uri("/echo"), body = b))
-          .map(_ => -1)
-          .handle { case EntityTooLarge(i) => i }
-          .run must be_==(3))
+        .value must returnValue(Some(-1))
+
+      st.apply(Request[IO](POST, uri("/echo"), body = b))
+        .map(_ => -1L)
+        .value
+        .handleError { case EntityTooLarge(i) => Some(i) } must returnValue(Some(3L))
     }
   }
 

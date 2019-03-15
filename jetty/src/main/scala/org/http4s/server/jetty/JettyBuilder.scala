@@ -2,219 +2,267 @@ package org.http4s
 package server
 package jetty
 
-import java.util
-import javax.servlet.{DispatcherType, Filter}
-
-import com.codahale.metrics.{InstrumentedExecutorService, MetricRegistry}
-import com.codahale.metrics.jetty9.InstrumentedQueuedThreadPool
-import org.eclipse.jetty.util.ssl.SslContextFactory
-import org.eclipse.jetty.util.thread.QueuedThreadPool
-import org.http4s.server.SSLSupport.{StoreInfo, SSLBits}
-
+import cats.effect._
 import java.net.InetSocketAddress
-import java.util.concurrent.ExecutorService
+import java.util
+import javax.net.ssl.SSLContext
+import javax.servlet.{DispatcherType, Filter}
 import javax.servlet.http.HttpServlet
-import org.eclipse.jetty.server.ServerConnector
-import org.http4s.servlet.{ServletIo, ServletContainer, Http4sServlet}
-
+import org.eclipse.jetty.server.{ServerConnector, Server => JServer}
+import org.eclipse.jetty.server.handler.StatisticsHandler
+import org.eclipse.jetty.servlet.{FilterHolder, ServletContextHandler, ServletHolder}
+import org.eclipse.jetty.util.component.{AbstractLifeCycle, LifeCycle}
+import org.eclipse.jetty.util.ssl.SslContextFactory
+import org.eclipse.jetty.util.thread.{QueuedThreadPool, ThreadPool}
+import org.http4s.server.SSLKeyStoreSupport.StoreInfo
+import org.http4s.servlet.{AsyncHttp4sServlet, ServletContainer, ServletIo}
+import org.log4s.getLogger
+import scala.collection.immutable
 import scala.concurrent.duration._
-import scalaz.concurrent.Task
 
-import org.eclipse.jetty.util.component.AbstractLifeCycle.AbstractLifeCycleListener
-import org.eclipse.jetty.util.component.LifeCycle
-import org.eclipse.jetty.server.{Server => JServer, _}
-import org.eclipse.jetty.servlet.{FilterHolder, ServletHolder, ServletContextHandler}
+sealed class JettyBuilder[F[_]] private (
+    socketAddress: InetSocketAddress,
+    threadPool: ThreadPool,
+    private val idleTimeout: Duration,
+    private val asyncTimeout: Duration,
+    shutdownTimeout: Duration,
+    private val servletIo: ServletIo[F],
+    sslBits: Option[SSLConfig],
+    mounts: Vector[Mount[F]],
+    private val serviceErrorHandler: ServiceErrorHandler[F],
+    banner: immutable.Seq[String]
+)(implicit protected val F: ConcurrentEffect[F])
+    extends ServletContainer[F]
+    with ServerBuilder[F] {
 
-sealed class JettyBuilder private (
-  socketAddress: InetSocketAddress,
-  private val serviceExecutor: ExecutorService,
-  private val idleTimeout: Duration,
-  private val asyncTimeout: Duration,
-  private val servletIo: ServletIo,
-  sslBits: Option[SSLBits],
-  mounts: Vector[Mount],
-  metricRegistry: Option[MetricRegistry],
-  metricPrefix: String
-)
-  extends ServerBuilder
-  with ServletContainer
-  with IdleTimeoutSupport
-  with SSLSupport
-  with MetricsSupport
-{
-  type Self = JettyBuilder
+  type Self = JettyBuilder[F]
 
-  private def copy(socketAddress: InetSocketAddress = socketAddress,
-                   serviceExecutor: ExecutorService = serviceExecutor,
-                   idleTimeout: Duration = idleTimeout,
-                   asyncTimeout: Duration = asyncTimeout,
-                   servletIo: ServletIo = servletIo,
-                   sslBits: Option[SSLBits] = sslBits,
-                   mounts: Vector[Mount] = mounts,
-                   metricRegistry: Option[MetricRegistry] = metricRegistry,
-                   metricPrefix: String = metricPrefix): JettyBuilder =
-    new JettyBuilder(socketAddress, serviceExecutor, idleTimeout, asyncTimeout, servletIo, sslBits, mounts, metricRegistry, metricPrefix)
+  private[this] val logger = getLogger
 
-  override def withSSL(keyStore: StoreInfo, keyManagerPassword: String, protocol: String, trustStore: Option[StoreInfo], clientAuth: Boolean): Self = {
-    copy(sslBits = Some(SSLBits(keyStore, keyManagerPassword, protocol, trustStore, clientAuth)))
-  }
+  private def copy(
+      socketAddress: InetSocketAddress = socketAddress,
+      threadPool: ThreadPool = threadPool,
+      idleTimeout: Duration = idleTimeout,
+      asyncTimeout: Duration = asyncTimeout,
+      shutdownTimeout: Duration = shutdownTimeout,
+      servletIo: ServletIo[F] = servletIo,
+      sslBits: Option[SSLConfig] = sslBits,
+      mounts: Vector[Mount[F]] = mounts,
+      serviceErrorHandler: ServiceErrorHandler[F] = serviceErrorHandler,
+      banner: immutable.Seq[String] = banner
+  ): Self =
+    new JettyBuilder(
+      socketAddress,
+      threadPool,
+      idleTimeout,
+      asyncTimeout,
+      shutdownTimeout,
+      servletIo,
+      sslBits,
+      mounts,
+      serviceErrorHandler,
+      banner)
 
-  override def bindSocketAddress(socketAddress: InetSocketAddress): JettyBuilder =
+  def withSSL(
+      keyStore: StoreInfo,
+      keyManagerPassword: String,
+      protocol: String = "TLS",
+      trustStore: Option[StoreInfo] = None,
+      clientAuth: SSLClientAuthMode = SSLClientAuthMode.NotRequested
+  ): Self =
+    copy(
+      sslBits = Some(KeyStoreBits(keyStore, keyManagerPassword, protocol, trustStore, clientAuth)))
+
+  def withSSLContext(
+      sslContext: SSLContext,
+      clientAuth: SSLClientAuthMode = SSLClientAuthMode.NotRequested): Self =
+    copy(sslBits = Some(SSLContextBits(sslContext, clientAuth)))
+
+  override def bindSocketAddress(socketAddress: InetSocketAddress): Self =
     copy(socketAddress = socketAddress)
 
-  override def withServiceExecutor(serviceExecutor: ExecutorService): JettyBuilder =
-    copy(serviceExecutor = serviceExecutor)
+  def withThreadPool(threadPool: ThreadPool): JettyBuilder[F] =
+    copy(threadPool = threadPool)
 
-  override def mountServlet(servlet: HttpServlet, urlMapping: String, name: Option[String] = None): JettyBuilder =
-    copy(mounts = mounts :+ Mount { (context, index, _) =>
+  override def mountServlet(
+      servlet: HttpServlet,
+      urlMapping: String,
+      name: Option[String] = None): Self =
+    copy(mounts = mounts :+ Mount[F] { (context, index, _) =>
       val servletName = name.getOrElse(s"servlet-$index")
       context.addServlet(new ServletHolder(servletName, servlet), urlMapping)
     })
 
-  override def mountFilter(filter: Filter, urlMapping: String, name: Option[String], dispatches: util.EnumSet[DispatcherType]): JettyBuilder =
-    copy(mounts = mounts :+ Mount { (context, index, _) =>
+  override def mountFilter(
+      filter: Filter,
+      urlMapping: String,
+      name: Option[String],
+      dispatches: util.EnumSet[DispatcherType]
+  ): Self =
+    copy(mounts = mounts :+ Mount[F] { (context, index, _) =>
       val filterName = name.getOrElse(s"filter-$index")
       val filterHolder = new FilterHolder(filter)
       filterHolder.setName(filterName)
       context.addFilter(filterHolder, urlMapping, dispatches)
     })
 
-  override def mountService(service: HttpService, prefix: String): JettyBuilder =
-    copy(mounts = mounts :+ Mount { (context, index, builder) =>
-      val servlet = new Http4sServlet(
+  def mountService(service: HttpRoutes[F], prefix: String): Self =
+    copy(mounts = mounts :+ Mount[F] { (context, index, builder) =>
+      val servlet = new AsyncHttp4sServlet(
         service = service,
         asyncTimeout = builder.asyncTimeout,
         servletIo = builder.servletIo,
-        threadPool = builder.instrumentedServiceExecutor
+        serviceErrorHandler = builder.serviceErrorHandler
       )
       val servletName = s"servlet-$index"
       val urlMapping = ServletContainer.prefixMapping(prefix)
       context.addServlet(new ServletHolder(servletName, servlet), urlMapping)
     })
 
-  override def withIdleTimeout(idleTimeout: Duration): JettyBuilder =
+  def withIdleTimeout(idleTimeout: Duration): Self =
     copy(idleTimeout = idleTimeout)
 
-  override def withAsyncTimeout(asyncTimeout: Duration): JettyBuilder =
+  def withAsyncTimeout(asyncTimeout: Duration): Self =
     copy(asyncTimeout = asyncTimeout)
 
-  override def withServletIo(servletIo: ServletIo): Self =
+  /** Sets the graceful shutdown timeout for Jetty.  Closing the resource
+    * will wait this long before a forcible stop. */
+  def withShutdownTimeout(shutdownTimeout: Duration): Self =
+    copy(shutdownTimeout = shutdownTimeout)
+
+  override def withServletIo(servletIo: ServletIo[F]): Self =
     copy(servletIo = servletIo)
 
-  /**
-   * Collects metrics into the specified [[MetricRegistry]], including:
-   * * Connections via [[InstrumentedConnectionFactory]]
-   * * The Jetty thread pool via [[InstrumentedQueuedThreadPool]]
-   * * HTTP responses via [[InstrumentedHandler]]
-   *
-   * @param metricRegistry The registry to collect metrics into..
-   */
-  override def withMetricRegistry(metricRegistry: MetricRegistry): Self =
-    copy(metricRegistry = Some(metricRegistry))
+  def withServiceErrorHandler(serviceErrorHandler: ServiceErrorHandler[F]): Self =
+    copy(serviceErrorHandler = serviceErrorHandler)
 
-  override def withMetricPrefix(metricPrefix: String): Self = copy(metricPrefix = metricPrefix)
+  def withBanner(banner: immutable.Seq[String]): Self =
+    copy(banner = banner)
 
-  private def getConnector(jetty: JServer): ServerConnector = sslBits match {
-    case Some(sslBits) =>
-      // SSL Context Factory
-      val sslContextFactory = new SslContextFactory()
-      sslContextFactory.setKeyStorePath(sslBits.keyStore.path)
-      sslContextFactory.setKeyStorePassword(sslBits.keyStore.password)
-      sslContextFactory.setKeyManagerPassword(sslBits.keyManagerPassword)
-      sslContextFactory.setNeedClientAuth(sslBits.clientAuth)
-      sslContextFactory.setProtocol(sslBits.protocol)
+  private def getConnector(jetty: JServer): ServerConnector = {
+    def httpsConnector(sslContextFactory: SslContextFactory) =
+      new ServerConnector(
+        jetty,
+        sslContextFactory
+      )
 
-      sslBits.trustStore.foreach { trustManagerBits =>
-        sslContextFactory.setTrustStorePath(trustManagerBits.path)
-        sslContextFactory.setTrustStorePassword(trustManagerBits.password)
-      }
+    sslBits match {
+      case Some(KeyStoreBits(keyStore, keyManagerPassword, protocol, trustStore, clientAuth)) =>
+        // SSL Context Factory
+        val sslContextFactory = new SslContextFactory()
+        sslContextFactory.setKeyStorePath(keyStore.path)
+        sslContextFactory.setKeyStorePassword(keyStore.password)
+        sslContextFactory.setKeyManagerPassword(keyManagerPassword)
+        sslContextFactory.setProtocol(protocol)
+        updateClientAuth(sslContextFactory, clientAuth)
 
-      // SSL HTTP Configuration
-      val https_config = new HttpConfiguration()
-
-      https_config.setSecureScheme("https")
-      https_config.setSecurePort(socketAddress.getPort)
-      https_config.addCustomizer(new SecureRequestCustomizer())
-
-      val connectionFactory = instrumentConnectionFactory(new HttpConnectionFactory(https_config))
-      new ServerConnector(jetty, new SslConnectionFactory(sslContextFactory,
-        org.eclipse.jetty.http.HttpVersion.HTTP_1_1.asString()),
-        connectionFactory)
-
-    case None =>
-      val connectionFactory = instrumentConnectionFactory(new HttpConnectionFactory)
-      new ServerConnector(jetty, connectionFactory)
-  }
-
-  private def instrumentConnectionFactory(connectionFactory: ConnectionFactory) =
-    metricRegistry.fold(connectionFactory) { reg =>
-      val timer = reg.timer(MetricRegistry.name(metricPrefix, "connections"))
-      new InstrumentedConnectionFactory(connectionFactory, timer)
-    }
-
-  private def instrumentedServiceExecutor = metricRegistry.fold(serviceExecutor) {
-    new InstrumentedExecutorService(serviceExecutor, _, MetricRegistry.name(metricPrefix, "service-executor"))
-  }
-
-  def start: Task[Server] = Task.delay {
-    val threadPool = metricRegistry.fold(new QueuedThreadPool)(new InstrumentedQueuedThreadPool(_))
-    val jetty = new JServer(threadPool)
-
-    val context = new ServletContextHandler()
-    context.setContextPath("/")
-
-    val handler = metricRegistry.fold[Handler](context) { reg =>
-      val h = InstrumentedHandler(reg, Option(metricPrefix))
-      h.setHandler(context)
-      h
-    }
-
-    jetty.setHandler(handler)
-
-    val connector = getConnector(jetty)
-
-    connector.setHost(socketAddress.getHostString)
-    connector.setPort(socketAddress.getPort)
-    connector.setIdleTimeout(if (idleTimeout.isFinite()) idleTimeout.toMillis else -1)
-    jetty.addConnector(connector)
-
-    for ((mount, i) <- mounts.zipWithIndex)
-      mount.f(context, i, this)
-
-    jetty.start()
-
-    new Server {
-      override def shutdown: Task[Unit] =
-        Task.delay {
-          jetty.stop()
+        trustStore.foreach { trustManagerBits =>
+          sslContextFactory.setTrustStorePath(trustManagerBits.path)
+          sslContextFactory.setTrustStorePassword(trustManagerBits.password)
         }
 
-      override def onShutdown(f: => Unit): this.type = {
-        jetty.addLifeCycleListener { new AbstractLifeCycleListener {
-          override def lifeCycleStopped(event: LifeCycle): Unit = f
-        }}
-        this
-      }
+        httpsConnector(sslContextFactory)
 
-      lazy val address: InetSocketAddress = {
-        val host = socketAddress.getHostString
-        val port = jetty.getConnectors()(0).asInstanceOf[ServerConnector].getLocalPort
-        new InetSocketAddress(host, port)
-      }
+      case Some(SSLContextBits(sslContext, clientAuth)) =>
+        val sslContextFactory = new SslContextFactory()
+        sslContextFactory.setSslContext(sslContext)
+        updateClientAuth(sslContextFactory, clientAuth)
+
+        httpsConnector(sslContextFactory)
+
+      case None =>
+        new ServerConnector(jetty)
     }
   }
+
+  private def updateClientAuth(
+      sslContextFactory: SslContextFactory,
+      clientAuthMode: SSLClientAuthMode): Unit =
+    clientAuthMode match {
+      case SSLClientAuthMode.NotRequested =>
+        sslContextFactory.setWantClientAuth(false)
+        sslContextFactory.setNeedClientAuth(false)
+
+      case SSLClientAuthMode.Requested =>
+        sslContextFactory.setWantClientAuth(true)
+
+      case SSLClientAuthMode.Required =>
+        sslContextFactory.setNeedClientAuth(true)
+    }
+
+  def resource: Resource[F, Server[F]] =
+    Resource(F.delay {
+      val jetty = new JServer(threadPool)
+
+      val context = new ServletContextHandler()
+      context.setContextPath("/")
+
+      jetty.setHandler(context)
+
+      val connector = getConnector(jetty)
+
+      connector.setHost(socketAddress.getHostString)
+      connector.setPort(socketAddress.getPort)
+      connector.setIdleTimeout(if (idleTimeout.isFinite()) idleTimeout.toMillis else -1)
+      jetty.addConnector(connector)
+
+      // Jetty graceful shutdown does not work without a stats handler
+      val stats = new StatisticsHandler
+      stats.setHandler(jetty.getHandler)
+      jetty.setHandler(stats)
+
+      jetty.setStopTimeout(shutdownTimeout match {
+        case d: FiniteDuration => d.toMillis
+        case _ => 0L
+      })
+
+      for ((mount, i) <- mounts.zipWithIndex)
+        mount.f(context, i, this)
+
+      jetty.start()
+
+      val server = new Server[F] {
+        lazy val address: InetSocketAddress = {
+          val host = socketAddress.getHostString
+          val port = jetty.getConnectors()(0).asInstanceOf[ServerConnector].getLocalPort
+          new InetSocketAddress(host, port)
+        }
+
+        lazy val isSecure: Boolean = sslBits.isDefined
+      }
+
+      banner.foreach(logger.info(_))
+      logger.info(
+        s"http4s v${BuildInfo.version} on Jetty v${JServer.getVersion} started at ${server.baseUri}")
+
+      server -> shutdown(jetty)
+    })
+
+  private def shutdown(jetty: JServer): F[Unit] =
+    F.async[Unit] { cb =>
+      jetty.addLifeCycleListener(
+        new AbstractLifeCycle.AbstractLifeCycleListener {
+          override def lifeCycleStopped(ev: LifeCycle) = cb(Right(()))
+          override def lifeCycleFailure(ev: LifeCycle, cause: Throwable) = cb(Left(cause))
+        }
+      )
+      jetty.stop()
+    }
 }
 
-object JettyBuilder extends JettyBuilder(
-  socketAddress = ServerBuilder.DefaultSocketAddress,
-  serviceExecutor = ServerBuilder.DefaultServiceExecutor,
-  idleTimeout = IdleTimeoutSupport.DefaultIdleTimeout,
-  asyncTimeout = AsyncTimeoutSupport.DefaultAsyncTimeout,
-  servletIo = ServletContainer.DefaultServletIo,
-  sslBits = None,
-  mounts = Vector.empty,
-  metricRegistry = None,
-  metricPrefix = MetricsSupport.DefaultPrefix
-)
+object JettyBuilder {
+  def apply[F[_]: ConcurrentEffect] = new JettyBuilder[F](
+    socketAddress = defaults.SocketAddress,
+    threadPool = new QueuedThreadPool(),
+    idleTimeout = defaults.IdleTimeout,
+    asyncTimeout = defaults.AsyncTimeout,
+    shutdownTimeout = defaults.ShutdownTimeout,
+    servletIo = ServletContainer.DefaultServletIo,
+    sslBits = None,
+    mounts = Vector.empty,
+    serviceErrorHandler = DefaultServiceErrorHandler,
+    banner = defaults.Banner
+  )
+}
 
-private case class Mount(f: (ServletContextHandler, Int, JettyBuilder) => Unit)
+private final case class Mount[F[_]](f: (ServletContextHandler, Int, JettyBuilder[F]) => Unit)

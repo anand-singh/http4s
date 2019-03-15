@@ -1,18 +1,16 @@
 package org.http4s.util
 
-import java.nio.charset.{ Charset, StandardCharsets }
-import java.time.{ZoneId, Instant}
+import cats.data.NonEmptyList
+import java.time.{Instant, ZoneId}
 import java.time.format.DateTimeFormatter
 import java.util.Locale
-
-import scodec.bits.ByteVector
 import scala.annotation.tailrec
 import scala.collection.immutable.BitSet
-
+import scala.concurrent.duration.FiniteDuration
 
 /** A type class that describes how to efficiently render a type
- * @tparam T the type which will be rendered
- */
+  * @tparam T the type which will be rendered
+  */
 trait Renderer[T] {
 
   /** Renders the object to the writer
@@ -29,13 +27,36 @@ object Renderer {
   implicit val RFC7231InstantRenderer: Renderer[Instant] = new Renderer[Instant] {
 
     private val dateFormat =
-      DateTimeFormatter.ofPattern("EEE, dd MMM yyyy HH:mm:ss zzz")
+      DateTimeFormatter
+        .ofPattern("EEE, dd MMM yyyy HH:mm:ss zzz")
         .withLocale(Locale.US)
-        .withZone(ZoneId.of("UTC"))
+        .withZone(ZoneId.of("GMT"))
 
     override def render(writer: Writer, t: Instant): writer.type =
       writer << dateFormat.format(t)
 
+  }
+
+  // Render a finite duration in seconds
+  implicit val finiteDurationRenderer: Renderer[FiniteDuration] = new Renderer[FiniteDuration] {
+    override def render(writer: Writer, d: FiniteDuration): writer.type =
+      writer << d.toSeconds.toString
+  }
+
+  // Render a long value, e.g. on the Age header
+  implicit val longRenderer: Renderer[Long] = new Renderer[Long] {
+    override def render(writer: Writer, d: Long): writer.type =
+      writer << d.toString
+  }
+
+  implicit def eitherRenderer[A, B](
+      implicit ra: Renderer[A],
+      rb: Renderer[B]): Renderer[Either[A, B]] = new Renderer[Either[A, B]] {
+    override def render(writer: Writer, e: Either[A, B]): writer.type =
+      e match {
+        case Left(a) => ra.render(writer, a)
+        case Right(b) => rb.render(writer, b)
+      }
   }
 }
 
@@ -46,7 +67,7 @@ trait Renderable extends Any {
   def render(writer: Writer): writer.type
 
   /** Generates a String rendering of this object */
-  def renderString = Renderer.renderString(this)
+  def renderString: String = Renderer.renderString(this)
 
   override def toString: String = renderString
 }
@@ -63,22 +84,25 @@ object Renderable {
 }
 
 object Writer {
-  val HeaderValueDQuote = BitSet("\\\"".map(_.toInt):_*)
+  val HeaderValueDQuote = BitSet("\\\"".map(_.toInt): _*)
 }
 
 /** Efficiently accumulate [[Renderable]] representations */
 trait Writer {
-  def append(s: String):                 this.type
+  def append(s: String): this.type
   def append(ci: CaseInsensitiveString): this.type = append(ci.toString)
-  def append(char: Char):                this.type = append(char.toString)
-  def append(float: Float):              this.type = append(float.toString)
-  def append(double: Double):            this.type = append(double.toString)
-  def append(int: Int):                  this.type = append(int.toString)
-  def append(long: Long):                this.type = append(long.toString)
+  def append(char: Char): this.type = append(char.toString)
+  def append(float: Float): this.type = append(float.toString)
+  def append(double: Double): this.type = append(double.toString)
+  def append(int: Int): this.type = append(int.toString)
+  def append(long: Long): this.type = append(long.toString)
 
   def append[T](r: T)(implicit R: Renderer[T]): this.type = R.render(this, r)
 
-  def quote(s: String, escapedChars: BitSet = Writer.HeaderValueDQuote, escapeChar: Char = '\\'): this.type = {
+  def quote(
+      s: String,
+      escapedChars: BitSet = Writer.HeaderValueDQuote,
+      escapeChar: Char = '\\'): this.type = {
     this << '"'
 
     @tailrec
@@ -86,14 +110,18 @@ trait Writer {
       val c = s.charAt(i)
       if (escapedChars.contains(c.toInt)) this << escapeChar
       this << c
-      go(i+1)
+      go(i + 1)
     }
 
     go(0)
     this << '"'
   }
 
-  def addStrings(s: Seq[String], sep: String = "", start: String = "", end: String = ""): this.type = {
+  def addStrings(
+      s: Seq[String],
+      sep: String = "",
+      start: String = "",
+      end: String = ""): this.type = {
     append(start)
     if (s.nonEmpty) {
       append(s.head)
@@ -102,14 +130,22 @@ trait Writer {
     append(end)
   }
 
-  def addStringNel(s: NonEmptyList[String], sep: String = "", start: String = "", end: String = ""): this.type = {
+  def addStringNel(
+      s: NonEmptyList[String],
+      sep: String = "",
+      start: String = "",
+      end: String = ""): this.type = {
     append(start)
     append(s.head)
     s.tail.foreach(s => append(sep).append(s))
     append(end)
   }
 
-  def addSeq[T: Renderer](s: Seq[T], sep: String = "", start: String = "", end: String = ""): this.type = {
+  def addSeq[T: Renderer](
+      s: Seq[T],
+      sep: String = "",
+      start: String = "",
+      end: String = ""): this.type = {
     append(start)
     if (s.nonEmpty) {
       append(s.head)
@@ -118,46 +154,34 @@ trait Writer {
     append(end)
   }
 
-  final def <<(s: String):                this.type = append(s)
-  final def <<#(s: String):               this.type = quote(s)
+  final def <<(s: String): this.type = append(s)
+  final def <<#(s: String): this.type = quote(s)
   final def <<(s: CaseInsensitiveString): this.type = append(s)
-  final def <<(char: Char):               this.type = append(char)
-  final def <<(float: Float):             this.type = append(float)
-  final def <<(double: Double):           this.type = append(double)
-  final def <<(int: Int):                 this.type = append(int)
-  final def <<(long: Long):               this.type = append(long)
-  final def <<[T: Renderer](r: T):        this.type = append(r)
-
+  final def <<(char: Char): this.type = append(char)
+  final def <<(float: Float): this.type = append(float)
+  final def <<(double: Double): this.type = append(double)
+  final def <<(int: Int): this.type = append(int)
+  final def <<(long: Long): this.type = append(long)
+  final def <<[T: Renderer](r: T): this.type = append(r)
 
 }
 
 /** [[Writer]] that will result in a `String`
   * @param size initial buffer size of the underlying `StringBuilder`
   */
-class StringWriter(size: Int = 64) extends Writer {
+class StringWriter(size: Int = StringWriter.InitialCapacity) extends Writer {
   private val sb = new java.lang.StringBuilder(size)
 
-  def append(s: String) = { sb.append(s); this }
-  override def append(char: Char) = { sb.append(char); this }
-  override def append(float: Float) = { sb.append(float); this }
-  override def append(double: Double) = { sb.append(double); this }
-  override def append(int: Int) = { sb.append(int); this }
-  override def append(long: Long) = { sb.append(long); this }
+  def append(s: String): this.type = { sb.append(s); this }
+  override def append(char: Char): this.type = { sb.append(char); this }
+  override def append(float: Float): this.type = { sb.append(float); this }
+  override def append(double: Double): this.type = { sb.append(double); this }
+  override def append(int: Int): this.type = { sb.append(int); this }
+  override def append(long: Long): this.type = { sb.append(long); this }
 
-  def result(): String = sb.toString
+  def result: String = sb.toString
 }
-/** [[Writer]] that will result in a `ByteVector`
-  * @param bv initial ByteVector`
-  */
-case class ByteVectorWriter(private var bv: ByteVector = ByteVector.empty,
-                            charset: Charset = StandardCharsets.UTF_8) extends Writer {
 
-  override def append(s: String)       = { bv = bv ++ ByteVector(s.getBytes(charset)); this}
-  override def append(char: Char)      = append(char.toString)
-  override def append(float: Float)    = append(float.toString)
-  override def append(double: Double)  = append(double.toString)
-  override def append(int: Int)        = append(int.toString)
-  override def append(long: Long)      = append(long.toString)
-
-  def toByteVector() = bv
+object StringWriter {
+  private val InitialCapacity = 64
 }

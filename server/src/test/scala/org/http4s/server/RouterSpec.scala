@@ -1,33 +1,35 @@
 package org.http4s
 package server
 
-import org.http4s.dsl._
+import cats.effect._
+import org.http4s.Uri.uri
+import org.http4s.dsl.io._
 
 class RouterSpec extends Http4sSpec {
-  val numbers: HttpService = HttpService {
+  val numbers = HttpRoutes.of[IO] {
     case GET -> Root / "1" =>
       Ok("one")
   }
-  val letters: HttpService = HttpService {
+  val letters = HttpRoutes.of[IO] {
     case GET -> Root / "/b" =>
       Ok("bee")
   }
-  val shadow: HttpService = HttpService {
+  val shadow = HttpRoutes.of[IO] {
     case GET -> Root / "shadowed" =>
       Ok("visible")
   }
-  val root: HttpService  = HttpService {
+  val root = HttpRoutes.of[IO] {
     case GET -> Root / "about" =>
       Ok("about")
     case GET -> Root / "shadow" / "shadowed" =>
       Ok("invisible")
   }
 
-  val notFound: HttpService = HttpService {
+  val notFound = HttpRoutes.of[IO] {
     case _ => NotFound("Custom NotFound")
   }
 
-  val service = Router(
+  val service = Router[IO](
     "/numbers" -> numbers,
     "/" -> root,
     "/shadow" -> shadow,
@@ -36,41 +38,41 @@ class RouterSpec extends Http4sSpec {
 
   "A router" should {
     "translate mount prefixes" in {
-      service.apply(Request(GET, uri("/numbers/1"))).run.as[String].run must_== ("one")
+      service.orNotFound(Request[IO](GET, uri("/numbers/1"))) must returnBody("one")
     }
 
     "require the correct prefix" in {
-      val resp = service.apply(Request(GET, uri("/letters/1"))).run
-      resp.as[String].run must_!= ("bee")
-      resp.as[String].run must_!= ("one")
-      resp.status must_== (NotFound)
+      val resp = service.orNotFound(Request[IO](GET, uri("/letters/1"))).unsafeRunSync()
+      resp must not(haveBody("bee"))
+      resp must not(haveBody("one"))
+      resp must haveStatus(NotFound)
     }
 
     "support root mappings" in {
-      service.apply(Request(GET, uri("/about"))).run.as[String].run must_== ("about")
+      service.orNotFound(Request[IO](GET, uri("/about"))) must returnBody("about")
     }
 
     "match longer prefixes first" in {
-      service.apply(Request(GET, uri("/shadow/shadowed"))).run.as[String].run must_== ("visible")
+      service.orNotFound(Request[IO](GET, uri("/shadow/shadowed"))) must returnBody("visible")
     }
 
     "404 on unknown prefixes" in {
-      service.apply(Request(GET, uri("/symbols/~"))).run.status must_== (NotFound)
+      service.orNotFound(Request[IO](GET, uri("/symbols/~"))) must returnStatus(NotFound)
     }
 
     "Allow passing through of routes with identical prefixes" in {
-      Router("" -> letters, "" -> numbers).apply(Request(GET, uri("/1")))
-        .run.as[String].run must_== ("one")
+      Router[IO]("" -> letters, "" -> numbers)
+        .orNotFound(Request[IO](GET, uri("/1"))) must returnBody("one")
     }
 
     "Serve custom NotFound responses" in {
-      Router("/foo" -> notFound).apply(Request(uri = uri("/foo/bar"))).run.as[String].run must_== ("Custom NotFound")
+      Router[IO]("/foo" -> notFound).orNotFound(Request[IO](uri = uri("/foo/bar"))) must returnBody(
+        "Custom NotFound")
     }
 
-    "Return the tagged NotFound response if no route is found" in {
-      val resp = Router("/foo" -> notFound).apply(Request(uri = uri("/bar"))).run
-      resp.attributes.contains(Fallthrough.fallthroughKey) must_== (true)
+    "Return the fallthrough response if no route is found" in {
+      val router = Router[IO]("/foo" -> notFound)
+      router(Request[IO](uri = uri("/bar"))).value must returnValue(None)
     }
-
   }
 }

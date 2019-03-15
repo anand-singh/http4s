@@ -2,52 +2,78 @@ package org.http4s
 package server
 package staticcontent
 
-import org.http4s.server.middleware.URITranslation
-import scodec.bits.ByteVector
-
-import scalaz.concurrent.Task
+import cats.effect._
+import org.http4s.headers.{`Accept-Encoding`, `If-Modified-Since`}
+import org.http4s.server.middleware.TranslateUri
+import org.http4s.Uri.uri
 
 class ResourceServiceSpec extends Http4sSpec with StaticContentShared {
 
-  val s = resourceService(ResourceService.Config(""))
+  val config =
+    ResourceService.Config[IO]("", blockingExecutionContext = testBlockingExecutionContext)
+  val routes = resourceService(config)
 
   "ResourceService" should {
 
     "Respect UriTranslation" in {
-      val s2 = URITranslation.translateRoot("/foo")(s)
+      val app = TranslateUri("/foo")(routes).orNotFound
 
-      def runReq(req: Request): (ByteVector, Response) = {
-        val resp = s2.apply(req).run
-        val body = resp.body.runLog.run.fold(ByteVector.empty)(_ ++ _)
-        (body, resp)
+      {
+        val req = Request[IO](uri = uri("foo/testresource.txt"))
+        app(req) must returnBody(testResource)
+        app(req) must returnStatus(Status.Ok)
       }
 
       {
-        val req = Request(uri = uri("foo/testresource.txt"))
-        val (bv,resp) = runReq(req)
-        bv must_== testResource
-        resp.status must_== Status.Ok
-      }
-
-      {
-        val req = Request(uri = uri("testresource.txt"))
-        val (_,resp) = runReq(req)
-        resp.status must_== Status.NotFound
+        val req = Request[IO](uri = uri("testresource.txt"))
+        app(req) must returnStatus(Status.NotFound)
       }
     }
 
     "Serve available content" in {
-      val req = Request(uri = Uri.fromString("testresource.txt").yolo)
-      val rb = runReq(req)
+      val req = Request[IO](uri = Uri.fromString("testresource.txt").yolo)
+      val rb = routes.orNotFound(req)
 
-      rb._1 must_== testResource
-      rb._2.status must_== Status.Ok
+      rb must returnBody(testResource)
+      rb must returnStatus(Status.Ok)
+    }
+
+    "Try to serve pre-gzipped content if asked to" in {
+      val req = Request[IO](
+        uri = Uri.fromString("testresource.txt").yolo,
+        headers = Headers(`Accept-Encoding`(ContentCoding.gzip))
+      )
+      val rb = resourceService(config.copy(preferGzipped = true)).orNotFound(req)
+
+      rb must returnBody(testResourceGzipped)
+      rb must returnStatus(Status.Ok)
+      rb must returnValue(haveMediaType(MediaType.text.plain))
+      rb must returnValue(haveContentCoding(ContentCoding.gzip))
+    }
+
+    "Fallback to un-gzipped file if pre-gzipped version doesn't exist" in {
+      val req = Request[IO](
+        uri = Uri.fromString("testresource2.txt").yolo,
+        headers = Headers(`Accept-Encoding`(ContentCoding.gzip))
+      )
+      val rb = resourceService(config.copy(preferGzipped = true)).orNotFound(req)
+
+      rb must returnBody(testResource)
+      rb must returnStatus(Status.Ok)
+      rb must returnValue(haveMediaType(MediaType.text.plain))
+      rb must not(returnValue(haveContentCoding(ContentCoding.gzip)))
     }
 
     "Generate non on missing content" in {
-      val req = Request(uri = Uri.fromString("testresource.txtt").yolo)
-      runReq(req)._2.status must_== (Status.NotFound)
+      val req = Request[IO](uri = Uri.fromString("testresource.txtt").yolo)
+      routes.orNotFound(req) must returnStatus(Status.NotFound)
+    }
+
+    "Not send unmodified files" in {
+      val req = Request[IO](uri = uri("testresource.txt"))
+        .putHeaders(`If-Modified-Since`(HttpDate.MaxValue))
+
+      runReq(req)._2.status must_== Status.NotModified
     }
   }
-
 }

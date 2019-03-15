@@ -2,38 +2,42 @@ package org.http4s
 package server
 package middleware
 
+import cats.data.OptionT
+import cats.effect._
+import cats.syntax.applicative._
+import org.http4s.dsl.io._
+
 class UrlFormLifterSpec extends Http4sSpec {
   val urlForm = UrlForm("foo" -> "bar")
 
-  val service = UrlFormLifter(HttpService {
-    case r@Request(Method.POST,_,_,_,_,_) =>
+  val app = UrlFormLifter(OptionT.liftK[IO])(HttpRoutes.of[IO] {
+    case r @ POST -> _ =>
       r.uri.multiParams.get("foo") match {
-        case Some(ps) => Response(status = Status.Ok).withBody(ps.mkString(","))
-        case None     => Response(status = Status.BadRequest).withBody("No Foo")
+        case Some(ps) =>
+          Ok(ps.mkString(","))
+        case None =>
+          BadRequest("No Foo")
       }
-  })
+  }).orNotFound
 
   "UrlFormLifter" should {
     "Add application/x-www-form-urlencoded bodies to the query params" in {
-      val req = Request(method = Method.POST).withBody(urlForm).run
-
-      val resp = service.apply(req).run
-      resp.status must_== Status.Ok
+      val req = Request[IO](method = POST).withEntity(urlForm).pure[IO]
+      req.flatMap(app.run) must returnStatus(Ok)
     }
 
     "Add application/x-www-form-urlencoded bodies after query params" in {
-      val req = Request(method = Method.POST, uri = Uri.uri("/foo?foo=biz")).withBody(urlForm).run
-
-      val resp = service.apply(req).run
-      resp.status must_== Status.Ok
-      resp.as[String].run must_== "biz,bar"
+      val req =
+        Request[IO](method = Method.POST, uri = Uri.uri("/foo?foo=biz"))
+          .withEntity(urlForm)
+          .pure[IO]
+      req.flatMap(app.run) must returnStatus(Ok)
+      req.flatMap(app.run) must returnBody("biz,bar")
     }
 
     "Ignore Requests that don't have application/x-www-form-urlencoded bodies" in {
-      val req = Request(method = Method.POST).withBody("foo").run
-
-      val resp = service.apply(req).run
-      resp.status must_== Status.BadRequest
+      val req = Request[IO](method = Method.POST).withEntity("foo").pure[IO]
+      req.flatMap(app.run) must returnStatus(BadRequest)
     }
   }
 }

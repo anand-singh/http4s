@@ -18,21 +18,26 @@
  */
 package org.http4s
 
-import org.http4s.util.{Writer, Renderable}
+import org.http4s.util.{Renderable, Writer}
 import scala.annotation.tailrec
 
 object LanguageTag {
 
   val `*` = LanguageTag("*", QValue.One)
 
-  def apply(primaryTag: String, subTags: String*): LanguageTag = LanguageTag(primaryTag, QValue.One, subTags)
+  def apply(primaryTag: String, subTags: String*): LanguageTag =
+    LanguageTag(primaryTag, QValue.One, subTags)
 
 //  def apply(primaryTag: String): LanguageTag = LanguageTag(primaryTag, Q.Unity)
 //  def apply(primaryTag: String, subTags: String*): LanguageTag = LanguageTag(primaryTag, Q.Unity, subTags)
 }
 
-case class LanguageTag(primaryTag: String, q: QValue = QValue.One, subTags: Seq[String] = Nil) extends Renderable {
+final case class LanguageTag(primaryTag: String, q: QValue = QValue.One, subTags: Seq[String] = Nil)
+    extends Renderable {
+  @deprecated("Use languageTag.withQValue", "0.16.1")
   def withQuality(q: QValue): LanguageTag = LanguageTag(primaryTag, q, subTags)
+
+  def withQValue(q: QValue): LanguageTag = copy(q = q)
 
   def render(writer: Writer): writer.type = {
     writer.append(primaryTag)
@@ -42,18 +47,22 @@ case class LanguageTag(primaryTag: String, q: QValue = QValue.One, subTags: Seq[
   }
 
   @tailrec
-  private def checkLists(tags1: Seq[String], tags2: Seq[String]): Boolean = {
+  private def checkLists(tags1: Seq[String], tags2: Seq[String]): Boolean =
     if (tags1.isEmpty) true
     else if (tags2.isEmpty || tags1.head != tags2.head) false
     else checkLists(tags1.tail, tags2.tail)
-  }
 
-  def satisfies(encoding: LanguageTag) = encoding.satisfiedBy(this)
-  def satisfiedBy(encoding: LanguageTag) = {
+  @deprecated("Use `Accept-Language`.satisfiedBy(encoding)", "0.16.1")
+  def satisfies(encoding: LanguageTag): Boolean = encoding.satisfiedBy(this)
+
+  @deprecated("Use `Accept-Language`.satisfiedBy(encoding)", "0.16.1")
+  def satisfiedBy(encoding: LanguageTag): Boolean =
     (this.primaryTag == "*" || this.primaryTag == encoding.primaryTag) &&
       q.isAcceptable && encoding.q.isAcceptable &&
       q <= encoding.q &&
       checkLists(subTags, encoding.subTags)
-  }
-}
 
+  def matches(languageTag: LanguageTag): Boolean =
+    this.primaryTag == "*" || (this.primaryTag == languageTag.primaryTag &&
+      checkLists(subTags, languageTag.subTags))
+}

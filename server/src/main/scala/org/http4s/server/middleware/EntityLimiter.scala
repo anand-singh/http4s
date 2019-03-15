@@ -1,34 +1,34 @@
-package org.http4s.server.middleware
+package org.http4s
+package server
+package middleware
 
-import org.http4s._
-import org.http4s.server._
-import scodec.bits.ByteVector
+import cats.ApplicativeError
+import cats.data.Kleisli
+import fs2._
 
 import scala.util.control.NoStackTrace
-import scalaz.stream.{Process1, process1}
-import scalaz.stream.Process._
 
 object EntityLimiter {
 
-  case class EntityTooLarge(limit: Int) extends Exception with NoStackTrace
+  final case class EntityTooLarge(limit: Long) extends Exception with NoStackTrace
 
-  val DefaultMaxEntitySize: Int = 2*1024*1024 // 2 MB default
+  val DefaultMaxEntitySize: Long = 2L * 1024L * 1024L // 2 MB default
 
-  def apply(service: HttpService, limit: Int = DefaultMaxEntitySize): HttpService =
-    service.local { req: Request => req.copy(body = req.body |> takeBytes(limit)) }
-
-  private def takeBytes(n: Int): Process1[ByteVector, ByteVector] = {
-    def go(taken: Int, chunk: ByteVector): Process1[ByteVector, ByteVector] = {
-      val sz = taken + chunk.length
-      if (sz > n) fail(EntityTooLarge(n))
-      else emit(chunk) ++ receive1(go(sz, _))
+  def apply[F[_], G[_], B](
+      @deprecatedName('service) http: Kleisli[F, Request[G], B],
+      limit: Long = DefaultMaxEntitySize)(
+      implicit G: ApplicativeError[G, Throwable]): Kleisli[F, Request[G], B] =
+    Kleisli { req =>
+      http(req.withBodyStream(req.body.through(takeLimited(limit))))
     }
-    receive1(go(0,_))
-  }
 
-  def comsumeUpTo(n: Int): Process1[ByteVector, ByteVector] = {
-    val p = process1.fold[ByteVector, ByteVector](ByteVector.empty) { (c1, c2) => c1 ++ c2 }
-    takeBytes(n) |> p
-  }
-
+  private def takeLimited[F[_]](n: Long)(
+      implicit F: ApplicativeError[F, Throwable]): Pipe[F, Byte, Byte] =
+    _.pull
+      .take(n)
+      .flatMap {
+        case Some(_) => Pull.raiseError[F](EntityTooLarge(n))
+        case None => Pull.done
+      }
+      .stream
 }

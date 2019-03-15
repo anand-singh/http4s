@@ -2,37 +2,42 @@ package org.http4s
 package server
 package staticcontent
 
-import java.util.concurrent.ExecutorService
-
-import org.http4s.server._
-import org.http4s.{Response, Request, StaticFile}
-
-import scalaz.concurrent.{Strategy, Task}
-
+import cats.data.{Kleisli, OptionT}
+import cats.effect._
+import scala.concurrent.ExecutionContext
 
 object ResourceService {
 
-  /** [[ResourceService]] configuration
+  /** [[org.http4s.server.staticcontent.ResourceService]] configuration
     *
     * @param basePath prefix of the path files will be served from
+    * @param blockingExecutionContext `ExecutionContext` to use when collecting content
     * @param pathPrefix prefix of the Uri that content will be served from
     * @param bufferSize size hint of internal buffers to use when serving resources
-    * @param executor [[ExecutorService]] to use when collecting content
-    * @param cacheStartegy strategy to use for caching purposes. Default to no caching.
+    * @param cacheStrategy strategy to use for caching purposes. Default to no caching.
+    * @param preferGzipped whether to serve pre-gzipped files (with extension ".gz") if they exist
     */
-  case class Config(basePath: String,
-                    pathPrefix: String = "",
-                    bufferSize: Int = 50*1024,
-                    executor: ExecutorService = Strategy.DefaultExecutorService,
-                    cacheStartegy: CacheStrategy = NoopCacheStrategy)
+  final case class Config[F[_]](
+      basePath: String,
+      blockingExecutionContext: ExecutionContext,
+      pathPrefix: String = "",
+      bufferSize: Int = 50 * 1024,
+      cacheStrategy: CacheStrategy[F] = NoopCacheStrategy[F],
+      preferGzipped: Boolean = false)
 
-  /** Make a new [[org.http4s.server.HttpService]] that serves static files. */
-  private[staticcontent] def apply(config: Config): Service[Request, Response] = Service.lift { req =>
-    val uriPath = req.pathInfo
-    if (!uriPath.startsWith(config.pathPrefix))
-      HttpService.notFound
-    else
-      StaticFile.fromResource(sanitize(config.basePath + '/' + getSubPath(uriPath, config.pathPrefix)))
-        .fold(HttpService.notFound)(config.cacheStartegy.cache(uriPath, _))
-  }
+  /** Make a new [[org.http4s.HttpRoutes]] that serves static files. */
+  private[staticcontent] def apply[F[_]: Effect: ContextShift](config: Config[F]): HttpRoutes[F] =
+    Kleisli {
+      case request if request.pathInfo.startsWith(config.pathPrefix) =>
+        StaticFile
+          .fromResource(
+            Uri.removeDotSegments(
+              s"${config.basePath}/${getSubPath(request.pathInfo, config.pathPrefix)}"),
+            config.blockingExecutionContext,
+            Some(request),
+            preferGzipped = config.preferGzipped
+          )
+          .semiflatMap(config.cacheStrategy.cache(request.pathInfo, _))
+      case _ => OptionT.none
+    }
 }

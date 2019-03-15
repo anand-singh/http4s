@@ -1,9 +1,12 @@
 package org.http4s
 package client
 
-import java.util.concurrent.ExecutorService
+import cats.effect._
+import cats.effect.concurrent.Semaphore
+import cats.implicits._
 
-import scalaz.concurrent.Task
+import scala.concurrent.ExecutionContext
+import scala.concurrent.duration.Duration
 
 /** Type that is responsible for the client lifecycle
   *
@@ -12,46 +15,66 @@ import scalaz.concurrent.Task
   * CPU time, SSL handshakes, etc. Because it can contain significant resources it
   * must have a mechanism to free resources associated with it.
   */
-trait ConnectionManager[A <: Connection] {
+trait ConnectionManager[F[_], A <: Connection[F]] {
 
   /** Bundle of the connection and wheither its new or not */
   // Sealed, rather than final, because SI-4440.
   sealed case class NextConnection(connection: A, fresh: Boolean)
 
   /** Shutdown this client, closing any open connections and freeing resources */
-  def shutdown(): Task[Unit]
+  def shutdown: F[Unit]
 
   /** Get a connection for the provided request key. */
-  def borrow(requestKey: RequestKey): Task[NextConnection]
+  def borrow(requestKey: RequestKey): F[NextConnection]
 
   /**
     * Release a connection.  The connection manager may choose to keep the connection for
     * subsequent calls to [[borrow]], or dispose of the connection.
     */
-  def release(connection: A): Task[Unit]
+  def release(connection: A): F[Unit]
 
   /**
     * Invalidate a connection, ensuring that its resources are freed.  The connection
     * manager may not return this connection on another borrow.
     */
-  def invalidate(connection: A): Task[Unit]
+  def invalidate(connection: A): F[Unit]
 }
 
 object ConnectionManager {
+
   /** Create a [[ConnectionManager]] that creates new connections on each request
     *
     * @param builder generator of new connections
     * */
-  def basic[A <: Connection](builder: ConnectionBuilder[A]): ConnectionManager[A] =
-    new BasicManager[A](builder)
+  def basic[F[_]: Sync, A <: Connection[F]](
+      builder: ConnectionBuilder[F, A]): ConnectionManager[F, A] =
+    new BasicManager[F, A](builder)
 
   /** Create a [[ConnectionManager]] that will attempt to recycle connections
     *
     * @param builder generator of new connections
     * @param maxTotal max total connections
-    * @param es `ExecutorService` where async operations will execute
+    * @param maxWaitQueueLimit maximum number requests waiting for a connection at any specific time
+    * @param maxConnectionsPerRequestKey Map of RequestKey to number of max connections
+    * @param executionContext `ExecutionContext` where async operations will execute
     */
-  def pool[A <: Connection](builder: ConnectionBuilder[A], maxTotal: Int, es: ExecutorService): ConnectionManager[A] =
-    new PoolManager[A](builder, maxTotal, es)
+  def pool[F[_]: Concurrent, A <: Connection[F]](
+      builder: ConnectionBuilder[F, A],
+      maxTotal: Int,
+      maxWaitQueueLimit: Int,
+      maxConnectionsPerRequestKey: RequestKey => Int,
+      responseHeaderTimeout: Duration,
+      requestTimeout: Duration,
+      executionContext: ExecutionContext): F[ConnectionManager[F, A]] =
+    Semaphore.uncancelable(1).map { semaphore =>
+      new PoolManager[F, A](
+        builder,
+        maxTotal,
+        maxWaitQueueLimit,
+        maxConnectionsPerRequestKey,
+        responseHeaderTimeout,
+        requestTimeout,
+        semaphore,
+        executionContext)
+    }
 }
-

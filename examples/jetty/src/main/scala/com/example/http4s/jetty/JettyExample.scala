@@ -1,21 +1,30 @@
 package com.example.http4s
 package jetty
 
-import javax.servlet._
-
+import cats.effect._
+import cats.implicits._
 import com.codahale.metrics.MetricRegistry
-import com.codahale.metrics.servlets.MetricsServlet
-import org.http4s.server.ServerApp
+import org.http4s.metrics.dropwizard._
+import org.http4s.server.HttpMiddleware
 import org.http4s.server.jetty.JettyBuilder
+import org.http4s.server.middleware.Metrics
 
-object JettyExample extends ServerApp {
-  val metrics = new MetricRegistry
+object JettyExample extends IOApp {
+  override def run(args: List[String]): IO[ExitCode] =
+    JettyExampleApp.builder[IO].serve.compile.drain.as(ExitCode.Success)
+}
 
-  def server(args: List[String]) = JettyBuilder
-    .bindHttp(8080)
-    .withMetricRegistry(metrics)
-    .mountService(ExampleService.service, "/http4s")
-    .mountServlet(new MetricsServlet(metrics), "/metrics/*")
-    .mountFilter(NoneShallPass, "/http4s/science/black-knight/*")
-    .start
+object JettyExampleApp {
+
+  def builder[F[_]: ConcurrentEffect: Timer: ContextShift]: JettyBuilder[F] = {
+    val metricsRegistry: MetricRegistry = new MetricRegistry
+    val metrics: HttpMiddleware[F] = Metrics[F](Dropwizard(metricsRegistry, "server"))
+
+    JettyBuilder[F]
+      .bindHttp(8080)
+      .mountService(metrics(new ExampleService[F].routes), "/http4s")
+      .mountService(metricsService(metricsRegistry), "/metrics")
+      .mountFilter(NoneShallPass, "/black-knight/*")
+  }
+
 }

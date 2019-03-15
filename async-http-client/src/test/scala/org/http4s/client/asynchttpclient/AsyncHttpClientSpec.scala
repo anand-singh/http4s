@@ -1,5 +1,9 @@
-package org.http4s.client.asynchttpclient
+package org.http4s
+package client
+package asynchttpclient
 
-import org.http4s.client.ClientRouteTestBattery
+import cats.effect.IO
 
-class AsyncHttpClientSpec extends ClientRouteTestBattery("AsyncHttpClient", AsyncHttpClient())
+class AsyncHttpClientSpec extends ClientRouteTestBattery("AsyncHttpClient") {
+  def clientResource = AsyncHttpClient.resource[IO]()
+}

@@ -1,31 +1,31 @@
 package org.http4s
 package server
 
-import java.net.{InetAddress, InetSocketAddress}
-import java.util.concurrent.{CountDownLatch, ExecutorService}
+import java.net.{Inet4Address, Inet6Address, InetSocketAddress}
+import org.log4s.getLogger
 
-import scalaz.concurrent.Task
-
-trait Server {
-  def shutdown: Task[Unit]
-
-  def shutdownNow(): Unit =
-    shutdown.run
-
-  @deprecated("Compose with the shutdown task instead.", "0.14")
-  def onShutdown(f: => Unit): this.type
+abstract class Server[F[_]] {
+  private[this] val logger = getLogger
 
   def address: InetSocketAddress
 
-  /**
-   * Blocks until the server shuts down.
-   */
-  @deprecated("Use ServerApp instead.", "0.14")
-  def awaitShutdown(): Unit = {
-    val latch = new CountDownLatch(1)
-    onShutdown(latch.countDown())
-    latch.await()
-  }
+  def isSecure: Boolean
+
+  def baseUri: Uri = Uri(
+    scheme = Some(if (isSecure) Uri.Scheme.https else Uri.Scheme.http),
+    authority = Some(
+      Uri.Authority(
+        host = address.getAddress match {
+          case ipv4: Inet4Address =>
+            Uri.IPv4(ipv4.getHostAddress)
+          case ipv6: Inet6Address =>
+            Uri.IPv6(ipv6.getHostAddress)
+          case weird =>
+            logger.warn(s"Unexpected address type ${weird.getClass}: $weird")
+            Uri.RegName(weird.getHostAddress)
+        },
+        port = Some(address.getPort)
+      )),
+    path = "/"
+  )
 }
-
-

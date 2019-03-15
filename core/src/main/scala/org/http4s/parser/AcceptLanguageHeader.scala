@@ -18,28 +18,29 @@
 package org.http4s
 package parser
 
-import org.parboiled2._
+import org.http4s.internal.parboiled2._
+import org.http4s.QValue.QValueParser
 
 private[parser] trait AcceptLanguageHeader {
 
-  def ACCEPT_LANGUAGE(value: String) = new AcceptLanguageParser(value).parse
+  def ACCEPT_LANGUAGE(value: String): ParseResult[headers.`Accept-Language`] =
+    new AcceptLanguageParser(value).parse
 
   private class AcceptLanguageParser(value: String)
-    extends Http4sHeaderParser[headers.`Accept-Language`](value) with MediaParser {
+      extends Http4sHeaderParser[headers.`Accept-Language`](value)
+      with MediaRange.MediaRangeParser
+      with QValueParser {
     def entry: Rule1[headers.`Accept-Language`] = rule {
       oneOrMore(languageTag).separatedBy(ListSep) ~> { tags: Seq[LanguageTag] =>
-        headers.`Accept-Language`(tags.head, tags.tail:_*)
+        headers.`Accept-Language`(tags.head, tags.tail: _*)
       }
     }
 
     def languageTag: Rule1[LanguageTag] = rule {
-      capture(oneOrMore(Alpha)) ~ zeroOrMore("-" ~ Token) ~ TagQuality ~>
-        { (main: String, sub: Seq[String], q: QValue) => LanguageTag(main, q, sub) }
-    }
-
-
-    def TagQuality: Rule1[QValue] = rule {
-      (";" ~ OptWS ~ "q" ~ "=" ~ QValue) | push(org.http4s.QValue.One)
+      capture(oneOrMore(Alpha)) ~ zeroOrMore("-" ~ Token) ~ QualityValue ~> {
+        (main: String, sub: Seq[String], q: QValue) =>
+          LanguageTag(main, q, sub)
+      }
     }
 
   }

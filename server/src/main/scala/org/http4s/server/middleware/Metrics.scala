@@ -1,113 +1,169 @@
-package org.http4s
-package server
-package middleware
+package org.http4s.server.middleware
 
+import cats.data._
+import cats.effect._
+import cats.effect.implicits._
+import cats.implicits._
+import fs2.Stream
 import java.util.concurrent.TimeUnit
+import org.http4s._
+import org.http4s.metrics.MetricsOps
+import org.http4s.metrics.TerminationType.{Abnormal, Error}
 
-import com.codahale.metrics._
-
-import org.http4s.{Method, Response, Request}
-
-import scalaz.stream.Cause.End
-import scalaz.{\/, -\/, \/-}
-import scalaz.concurrent.Task
-import scalaz.stream.Process.{Halt, halt}
-
+/**
+  * Server middleware to record metrics for the http4s server.
+  *
+  * This middleware will record:
+  * - Number of active requests
+  * - Time duration to send the response headers
+  * - Time duration to send the whole response body
+  * - Time duration of errors and other abnormal terminations
+  *
+  * This middleware can be extended to support any metrics ecosystem by implementing the [[MetricsOps]] type
+  */
 object Metrics {
 
-  def meter(m: MetricRegistry, name: String)(srvc: HttpService): HttpService = {
-
-    val active_requests = m.counter(name + ".active-requests")
-
-    val abnormal_termination = m.timer(name + ".abnormal-termination")
-    val service_failure = m.timer(name + ".service-error")
-    val headers_times = m.timer(name + ".headers-times")
-
-
-    val resp1xx = m.timer(name + ".1xx-responses")
-    val resp2xx = m.timer(name + ".2xx-responses")
-    val resp3xx = m.timer(name + ".3xx-responses")
-    val resp4xx = m.timer(name + ".4xx-responses")
-    val resp5xx = m.timer(name + ".5xx-responses")
-//    "org.eclipse.jetty.servlet.ServletContextHandler.async-dispatches"
-//    "org.eclipse.jetty.servlet.ServletContextHandler.async-timeouts"
-
-//    "http.connections"
-
-//    "org.eclipse.jetty.servlet.ServletContextHandler.dispatches"
-    val get_req = m.timer(name + ".get-requests")
-    val post_req = m.timer(name + ".post-requests")
-    val put_req = m.timer(name + ".put-requests")
-    val head_req = m.timer(name + ".head-requests")
-    val move_req = m.timer(name + ".move-requests")
-    val options_req = m.timer(name + ".options-requests")
-
-    val trace_req = m.timer(name + ".trace-requests")
-    val connect_req = m.timer(name + ".connect-requests")
-    val delete_req = m.timer(name + ".delete-requests")
-    val other_req = m.timer(name + ".other-requests")
-    val total_req = m.timer(name + ".requests")
-
-
-    def generalMetrics(method: Method, elapsed: Long): Unit = {
-      method match {
-        case Method.GET     => get_req.update(elapsed, TimeUnit.NANOSECONDS)
-        case Method.POST    => post_req.update(elapsed, TimeUnit.NANOSECONDS)
-        case Method.PUT     => put_req.update(elapsed, TimeUnit.NANOSECONDS)
-        case Method.HEAD    => head_req.update(elapsed, TimeUnit.NANOSECONDS)
-        case Method.MOVE    => move_req.update(elapsed, TimeUnit.NANOSECONDS)
-        case Method.OPTIONS => options_req.update(elapsed, TimeUnit.NANOSECONDS)
-        case Method.TRACE   => trace_req.update(elapsed, TimeUnit.NANOSECONDS)
-        case Method.CONNECT => connect_req.update(elapsed, TimeUnit.NANOSECONDS)
-        case Method.DELETE  => delete_req.update(elapsed, TimeUnit.NANOSECONDS)
-        case _              => other_req.update(elapsed, TimeUnit.NANOSECONDS)
+  /**
+    * A server middleware capable of recording metrics
+    *
+    * @param ops a algebra describing the metrics operations
+    * @param emptyResponseHandler an optional http status to be registered for requests that do not match
+    * @param errorResponseHandler a function that maps a [[Throwable]] to an optional http status code to register
+    * @param classifierF a function that allows to add a classifier that can be customized per request
+    * @return the metrics middleware
+    */
+  def apply[F[_]](
+      ops: MetricsOps[F],
+      emptyResponseHandler: Option[Status] = Status.NotFound.some,
+      errorResponseHandler: Throwable => Option[Status] = _ => Status.InternalServerError.some,
+      classifierF: Request[F] => Option[String] = { _: Request[F] =>
+        None
       }
+  )(routes: HttpRoutes[F])(implicit F: Effect[F], clock: Clock[F]): HttpRoutes[F] =
+    Kleisli(
+      metricsService[F](ops, routes, emptyResponseHandler, errorResponseHandler, classifierF)(_))
 
-      total_req.update(elapsed, TimeUnit.NANOSECONDS)
-      active_requests.dec()
-    }
-
-    def onFinish(method: Method, start: Long)(r: Throwable \/ Response): Throwable \/ Response = {
-      val elapsed = System.nanoTime() - start
-
-      r match {
-        case \/-(r) =>
-          headers_times.update(System.nanoTime() - start, TimeUnit.NANOSECONDS)
-          val code = r.status.code
-
-          val body = r.body.onHalt { cause =>
-            val elapsed = System.nanoTime() - start
-
-            generalMetrics(method, elapsed)
-
-            if (code < 200) resp1xx.update(elapsed, TimeUnit.NANOSECONDS)
-            else if (code < 300) resp2xx.update(elapsed, TimeUnit.NANOSECONDS)
-            else if (code < 400) resp3xx.update(elapsed, TimeUnit.NANOSECONDS)
-            else if (code < 500) resp4xx.update(elapsed, TimeUnit.NANOSECONDS)
-            else resp5xx.update(elapsed, TimeUnit.NANOSECONDS)
-
-            cause match {
-              case End => halt
-              case _   =>
-                abnormal_termination.update(elapsed, TimeUnit.NANOSECONDS)
-                Halt(cause)
-            }
-          }
-
-          \/-(r.copy(body = body))
-
-       case e@ -\/(_)       =>
-          generalMetrics(method, elapsed)
-          resp5xx.update(elapsed, TimeUnit.NANOSECONDS)
-          service_failure.update(elapsed, TimeUnit.NANOSECONDS)
-          e
-      }
-    }
-
-    Service.lift { req: Request =>
-      val now = System.nanoTime()
-      active_requests.inc()
-      new Task(srvc(req).get.map(onFinish(req.method, now)))
-    }
+  private def metricsService[F[_]: Sync](
+      ops: MetricsOps[F],
+      routes: HttpRoutes[F],
+      emptyResponseHandler: Option[Status],
+      errorResponseHandler: Throwable => Option[Status],
+      classifierF: Request[F] => Option[String]
+  )(req: Request[F])(implicit clock: Clock[F]): OptionT[F, Response[F]] = OptionT {
+    for {
+      initialTime <- clock.monotonic(TimeUnit.NANOSECONDS)
+      result <- ops
+        .increaseActiveRequests(classifierF(req))
+        .bracketCase { _ =>
+          for {
+            responseOpt <- routes(req).value
+            headersElapsed <- clock.monotonic(TimeUnit.NANOSECONDS)
+            result <- responseOpt.fold(
+              onEmpty[F](
+                req.method,
+                initialTime,
+                headersElapsed,
+                ops,
+                emptyResponseHandler,
+                classifierF(req))
+                .as(Option.empty[Response[F]])
+            )(
+              onResponse(req.method, initialTime, headersElapsed, ops, classifierF(req))(_).some
+                .pure[F]
+            )
+          } yield result
+        } {
+          case (_, ExitCase.Completed) => Sync[F].unit
+          case (_, ExitCase.Canceled) =>
+            onServiceCanceled(
+              initialTime,
+              ops,
+              classifierF(req)
+            )
+          case (_, ExitCase.Error(e)) =>
+            for {
+              headersElapsed <- clock.monotonic(TimeUnit.NANOSECONDS)
+              out <- onServiceError(
+                req.method,
+                initialTime,
+                headersElapsed,
+                ops,
+                errorResponseHandler(e),
+                classifierF(req)
+              )
+            } yield out
+        }
+    } yield result
   }
+
+  private def onEmpty[F[_]: Sync](
+      method: Method,
+      start: Long,
+      headerTime: Long,
+      ops: MetricsOps[F],
+      emptyResponseHandler: Option[Status],
+      classifier: Option[String]
+  )(implicit clock: Clock[F]): F[Unit] =
+    for {
+      now <- clock.monotonic(TimeUnit.NANOSECONDS)
+      _ <- emptyResponseHandler.traverse_(
+        status =>
+          ops.recordHeadersTime(method, headerTime - start, classifier) *>
+            ops.recordTotalTime(method, status, now - start, classifier))
+      _ <- ops.decreaseActiveRequests(classifier)
+    } yield ()
+
+  private def onResponse[F[_]: Sync](
+      method: Method,
+      start: Long,
+      headerTime: Long,
+      ops: MetricsOps[F],
+      classifier: Option[String]
+  )(r: Response[F])(implicit clock: Clock[F]): Response[F] = {
+    val newBody = r.body
+      .onFinalize {
+        for {
+          now <- clock.monotonic(TimeUnit.NANOSECONDS)
+          _ <- ops.recordHeadersTime(method, headerTime - start, classifier)
+          _ <- ops.recordTotalTime(method, r.status, now - start, classifier)
+          _ <- ops.decreaseActiveRequests(classifier)
+        } yield {}
+      }
+      .handleErrorWith(e =>
+        for {
+          now <- Stream.eval(clock.monotonic(TimeUnit.NANOSECONDS))
+          _ <- Stream.eval(ops.recordAbnormalTermination(now - start, Abnormal, classifier))
+          r <- Stream.raiseError[F](e)
+        } yield r)
+    r.copy(body = newBody)
+  }
+
+  private def onServiceError[F[_]: Sync](
+      method: Method,
+      start: Long,
+      headerTime: Long,
+      ops: MetricsOps[F],
+      errorResponseHandler: Option[Status],
+      classifier: Option[String]
+  )(implicit clock: Clock[F]): F[Unit] =
+    for {
+      now <- clock.monotonic(TimeUnit.NANOSECONDS)
+      _ <- errorResponseHandler.traverse_(
+        status =>
+          ops.recordHeadersTime(method, headerTime - start, classifier) *>
+            ops.recordTotalTime(method, status, now - start, classifier) *>
+            ops.recordAbnormalTermination(now - start, Error, classifier))
+      _ <- ops.decreaseActiveRequests(classifier)
+    } yield ()
+
+  private def onServiceCanceled[F[_]: Sync](
+      start: Long,
+      ops: MetricsOps[F],
+      classifier: Option[String]
+  )(implicit clock: Clock[F]): F[Unit] =
+    for {
+      now <- clock.monotonic(TimeUnit.NANOSECONDS)
+      _ <- ops.recordAbnormalTermination(now - start, Abnormal, classifier)
+      _ <- ops.decreaseActiveRequests(classifier)
+    } yield ()
 }

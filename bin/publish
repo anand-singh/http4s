@@ -1,4 +1,0 @@
-#!/bin/bash
-
-sbt "set scalazVersion in ThisBuild := \"7.1.7\"" +clean +publishSigned
-sbt "set scalazVersion in ThisBuild := \"7.2.1\"" +clean +publishSigned

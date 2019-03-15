@@ -1,31 +1,55 @@
 language: scala
-scala:
-- 2.10.6
-- 2.11.8
-jdk: oraclejdk8
+dist: trusty
+branches:
+  only:
+    - master
+    - /^release-/
 env:
   global:
-  - secure: d1FSl5YJDbNXvOY7185WfF8PbiccHA1oyb8/qyBJcKX070ovNNA1HYl09DR+62ZxkYDWPuFx4f1FfL8OiGWdCRJC2qfBe5SDLOzjGJE8wvD0oyHp4h71XLJ6mbtInixYzgJwpDfW8c+lmODo6Z7MGr5JSlxagXpiTVu9Gv4dygw=
-  matrix:
-  - SCALAZ_VERSION=7.1.7
-  - SCALAZ_VERSION=7.2.1
-rvm:
-- 2.2.3
-before_script:
-- mkdir -p $HOME/.sbt/launchers/0.13.8/
-- curl -L -o $HOME/.sbt/launchers/0.13.8/sbt-launch.jar http://dl.bintray.com/typesafe/ivy-releases/org.scala-sbt/sbt-launch/0.13.8/sbt-launch.jar
-script: bash bin/travis
-webhooks:
-  urls:
-  - https://webhooks.gitter.im/e/aadbcad1ca1e91b5a189
-  on_success: change
-  on_failure: always
-  on_start: false
-sudo: false
+  - HUGO_VERSION=0.26
+  - LOGBACK_ROOT_LEVEL=WARN
+  - LOGBACK_EXCEPTION_PATTERN=%xThrowable{3}
+  - ROOT_DIR="."
+matrix:
+  include:
+  - jdk: oraclejdk8
+    scala: 2.12.8
+  - jdk: oraclejdk8
+    scala: 2.11.12
+  - jdk: openjdk11
+    scala: 2.12.8
+  - jdk: oraclejdk8
+    env: 
+    - ROOT_DIR="scalafix"
+    scala: 2.12.8
+  allow_failures:
+    - jdk: openjdk11
+      scala: 2.12.8
+notifications:
+  webhooks:
+    urls:
+      - secure: "aD5b1XnAbGJi6YYofSUdradQngsxkG+xlrbev2kv/xSxD3LtzEiUrewODYmDCPiAL3biTi9/4Ye5mkC7g0ksW1X5ZpW46c5cxpuICE14Ke8EdGF4xK7HW70GvK4We9s8xDddHR4QrNk6G216B+9IPgrnT/VkCaJ327AM5oGWoDY="
+    on_success: change
+    on_failure: always
+    on_start: never
+sudo: required
 cache:
   directories:
+  - "$HOME/.coursier/cache"
   - "$HOME/.ivy2/cache"
-before_install:
-- rvm install 2.2.3
-- openssl aes-256-cbc -K $encrypted_cb02ffa32b87_key -iv $encrypted_cb02ffa32b87_iv
-  -in bin/prebuild.enc -d | sh
+  - "$HOME/.sbt/boot"
+
+install:
+  - scripts/install-hugo
+
+before_script:
+  - source scripts/helpers
+  - PATH="$HOME/bin:$PATH"
+  - decrypt_deploy_key
+  - decrypt_pgp_secrets
+  - configure_git
+script:
+  - cd $ROOT_DIR && sbt ++$TRAVIS_SCALA_VERSION ci
+
+before_cache:
+  - cleanup_cache

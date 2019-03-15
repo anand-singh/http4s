@@ -18,56 +18,62 @@
 package org.http4s
 package parser
 
-import org.parboiled2.{Rule0, Rule1, ParserInput}
+import cats.data.NonEmptyList
 import org.http4s.headers.Authorization
-import org.http4s.util.CaseInsensitiveString._
+import org.http4s.internal.parboiled2.{ParserInput, Rule0, Rule1}
+import org.http4s.syntax.string._
 
 private[parser] trait AuthorizationHeader {
+  def AUTHORIZATION(value: String): ParseResult[`Authorization`] =
+    new AuthorizationParser(value).parse
 
-  def AUTHORIZATION(value: String) = new AuthorizationParser(value).parse
-
-  private class AuthorizationParser(input: ParserInput) extends Http4sHeaderParser[Authorization](input) {
+  // scalastyle:off public.methods.have.type
+  private class AuthorizationParser(input: ParserInput)
+      extends Http4sHeaderParser[Authorization](input) {
     def entry: Rule1[Authorization] = rule {
-      CredentialDef ~ EOI ~> (Authorization(_))
+      CredentialDef ~ EOI ~> { creds: Credentials =>
+        Authorization(creds)
+      }
     }
 
     def CredentialDef = rule {
-      BasicCredentialDef | OAuth2BearerTokenDef | GenericHttpCredentialsDef
+      AuthParamsCredentialsDef |
+        TokenCredentialsDef
     }
 
-    def BasicCredentialDef: Rule1[BasicCredentials] = rule {
-      "Basic" ~ oneOrMore(LWS) ~ capture(BasicCookie) ~> {s: String => BasicCredentials(s) }
+    def TokenCredentialsDef = rule {
+      Token ~ LWS ~ token68 ~> { (scheme: String, value: String) =>
+        Credentials.Token(scheme.ci, value)
+      }
     }
 
-    def BasicCookie: Rule0 = rule {
-      oneOrMore(Base64Char) ~ optional("==" | ch('='))
+    def AuthParamsCredentialsDef = rule {
+      Token ~ OptWS ~ CredentialParams ~> {
+        (scheme: String, params: NonEmptyList[(String, String)]) =>
+          Credentials.AuthParams(scheme.ci, params)
+      }
     }
 
-    def OAuth2BearerTokenDef: Rule1[OAuth2BearerToken] = rule {
-      "Bearer" ~ oneOrMore(LWS) ~ b64token ~> (OAuth2BearerToken(_))
-    }
-
-    def GenericHttpCredentialsDef = rule {
-      Token ~ OptWS ~ CredentialParams ~> { (scheme: String, params: Map[String, String]) =>
-        GenericCredentials(scheme.ci, params) }
-    }
-
-    def CredentialParams: Rule1[Map[String, String]] = rule {
-      oneOrMore(AuthParam).separatedBy(ListSep) ~> (_.toMap) |
-        (Token | QuotedString) ~> (param => Map("" -> param)) |
-        push(Map.empty[String, String])
+    def CredentialParams: Rule1[NonEmptyList[(String, String)]] = rule {
+      oneOrMore(AuthParam).separatedBy(ListSep) ~> { params: Seq[(String, String)] =>
+        NonEmptyList(params.head, params.tail.toList)
+      }
     }
 
     def AuthParam: Rule1[(String, String)] = rule {
-      Token ~ "=" ~ (Token | QuotedString) ~> { (s1: String, s2: String) => (s1, s2) }
+      Token ~ "=" ~ (Token | QuotedString) ~> { (s1: String, s2: String) =>
+        (s1, s2)
+      }
     }
 
     def Base64Char: Rule0 = rule { Alpha | Digit | '+' | '/' | '=' }
 
     // https://tools.ietf.org/html/rfc6750#page-5
     def b64token: Rule1[String] = rule {
-      capture(oneOrMore(Alpha | Digit | anyOf("-._~+/")) ~ zeroOrMore('=') )
+      capture(oneOrMore(Alpha | Digit | anyOf("-._~+/")) ~ zeroOrMore('='))
     }
-  }
 
+    def token68: Rule1[String] = b64token
+  }
+  // scalastyle:on public.methods.have.type
 }

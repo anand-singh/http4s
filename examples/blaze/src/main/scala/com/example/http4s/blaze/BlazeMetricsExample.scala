@@ -1,41 +1,35 @@
 package com.example.http4s.blaze
 
-/// code_ref: blaze_server_example
-
-import java.util.concurrent.TimeUnit
-
+import cats.effect._
+import com.codahale.metrics.{Timer => _, _}
 import com.example.http4s.ExampleService
-import org.http4s._
-import org.http4s.server.ServerApp
-import org.http4s.server.Router
-import org.http4s.server.blaze.BlazeBuilder
+import org.http4s.HttpApp
+import org.http4s.implicits._
+import org.http4s.metrics.dropwizard._
+import org.http4s.server.{HttpMiddleware, Router}
+import org.http4s.server.blaze.BlazeServerBuilder
 import org.http4s.server.middleware.Metrics
-import org.http4s.dsl._
 
-import com.codahale.metrics._
-import com.codahale.metrics.json.MetricsModule
-
-import com.fasterxml.jackson.databind.ObjectMapper
-
-object BlazeMetricsExample extends ServerApp {
-
-  val metrics = new MetricRegistry()
-  val mapper = new ObjectMapper()
-                  .registerModule(new MetricsModule(TimeUnit.SECONDS, TimeUnit.SECONDS, true))
-
-  val metricsService = HttpService {
-    case GET -> Root =>
-      val writer = mapper.writerWithDefaultPrettyPrinter()
-      Ok(writer.writeValueAsString(metrics))
-  }
-
-  val srvc = Router(
-    "" -> Metrics.meter(metrics, "Sample")(ExampleService.service),
-    "/metrics" -> metricsService
-  )
-
-  def server(args: List[String]) = BlazeBuilder.bindHttp(8080)
-    .mountService(srvc, "/http4s")
-    .start
+class BlazeMetricsExample(implicit timer: Timer[IO], ctx: ContextShift[IO])
+    extends BlazeMetricsExampleApp[IO]
+    with IOApp {
+  override def run(args: List[String]): IO[ExitCode] =
+    stream.compile.toList.map(_.head)
 }
-/// end_code_ref
+
+class BlazeMetricsExampleApp[F[_]: ConcurrentEffect: ContextShift: Timer] {
+  val metricsRegistry: MetricRegistry = new MetricRegistry()
+  val metrics: HttpMiddleware[F] = Metrics[F](Dropwizard(metricsRegistry, "server"))
+
+  def app: HttpApp[F] =
+    Router(
+      "/http4s" -> metrics(new ExampleService[F].routes),
+      "/http4s/metrics" -> metricsService[F](metricsRegistry)
+    ).orNotFound
+
+  def stream: fs2.Stream[F, ExitCode] =
+    BlazeServerBuilder[F]
+      .bindHttp(8080)
+      .withHttpApp(app)
+      .serve
+}

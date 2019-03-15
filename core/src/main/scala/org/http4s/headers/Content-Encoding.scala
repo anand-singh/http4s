@@ -10,7 +10,6 @@ object `Content-Encoding` extends HeaderKey.Internal[`Content-Encoding`] with He
 }
 
 final case class `Content-Encoding`(contentCoding: ContentCoding) extends Header.Parsed {
-  override def key = `Content-Encoding`
+  override def key: `Content-Encoding`.type = `Content-Encoding`
   override def renderValue(writer: Writer): writer.type = contentCoding.render(writer)
 }
-

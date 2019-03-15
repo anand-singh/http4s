@@ -2,45 +2,41 @@ package org.http4s
 package server
 package middleware
 
-import scala.concurrent.duration._
-import scalaz.concurrent.Task
-import java.util.concurrent.{TimeUnit, ScheduledThreadPoolExecutor}
-import scalaz.\/-
-import scalaz.syntax.monad._
+import cats.data.Kleisli
+import cats.effect._
+import cats.implicits._
+import scala.concurrent.duration.FiniteDuration
 
 object Timeout {
 
-  // TODO: this should probably be replaced with a low res executor to save clock cycles
-  private val ec = new ScheduledThreadPoolExecutor(1)
-
-  val DefaultTimeoutResponse = Response(Status.InternalServerError)
-    .withBody("The service timed out.")
-
-  private def timeoutResp(timeout: Duration, response: Task[Response]): Task[Response] = Task.async[Task[Response]] { cb =>
-    val r = new Runnable { override def run(): Unit = cb(\/-(response)) }
-    ec.schedule(r, timeout.toNanos, TimeUnit.NANOSECONDS)
-  }.join
-
-    /** Transform the service such to return whichever resolves first:
-      * the provided Task[Response], or the result of the service
-      * @param r Task[Response] to race against the result of the service. This will be run for each [[Request]]
-      * @param service [[org.http4s.server.HttpService]] to transform
-      */
-  def apply(r: Task[Response])(service: HttpService): HttpService = Service.lift { req =>
-      Task.taskInstance.chooseAny(service(req), r :: Nil).map(_._1)
-    }
-
-  /** Transform the service to return a RequestTimeOut [[Status]] after the supplied Duration
-    * @param timeout Duration to wait before returning the RequestTimeOut
-    * @param service [[HttpService]] to transform
+  /** Transform the service to return a timeout response after the given
+    * duration if the service has not yet responded.  If the timeout
+    * fires, the service's response is canceled.
+    *
+    * @param timeout Finite duration to wait before returning a `500
+    * Internal Server Error` response
+    * @param service [[HttpRoutes]] to transform
     */
-  def apply(timeout: Duration, response: Task[Response] = DefaultTimeoutResponse)(service: HttpService): HttpService = {
-    if (timeout.isFinite()) apply(timeoutResp(timeout, response))(service)
-    else service
-  }
+  def apply[F[_], G[_], A](timeout: FiniteDuration, timeoutResponse: F[Response[G]])(
+      @deprecatedName('service) http: Kleisli[F, A, Response[G]])(
+      implicit F: Concurrent[F],
+      T: Timer[F]): Kleisli[F, A, Response[G]] =
+    http
+      .mapF(respF => F.race(respF, T.sleep(timeout) *> timeoutResponse))
+      .map(_.merge)
 
-  /** Transform the service to return a RequestTimeOut [[Status]] after 30 seconds
-    * @param service [[HttpService]] to transform
+  /** Transform the service to return a timeout response after the given
+    * duration if the service has not yet responded.  If the timeout
+    * fires, the service's response is canceled.
+    *
+    * @param timeout Finite duration to wait before returning a `500
+    * Internal Server Error` response
+    * @param service [[HttpRoutes]] to transform
     */
-  def apply(service: HttpService): HttpService = apply(30.seconds)(service)
+  def apply[F[_], G[_], A](timeout: FiniteDuration)(
+      @deprecatedName('service) http: Kleisli[F, A, Response[G]])(
+      implicit F: Concurrent[F],
+      T: Timer[F]
+  ): Kleisli[F, A, Response[G]] =
+    apply(timeout, Response.timeout[G].pure[F])(http)
 }

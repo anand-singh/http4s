@@ -1,97 +1,137 @@
 package org.http4s
 package client
 
+import cats.effect._
+import cats.implicits._
+import fs2._
+import fs2.io._
 import java.net.InetSocketAddress
 import javax.servlet.http.{HttpServlet, HttpServletRequest, HttpServletResponse}
-
-
-import org.http4s.Uri.{Authority, RegName}
 import org.http4s.client.testroutes.GetRoutes
+import org.http4s.client.dsl.Http4sClientDsl
+import org.http4s.dsl.io._
+import org.http4s.multipart.{Multipart, Part}
+import org.specs2.specification.core.Fragments
+import scala.collection.compat._
+import scala.concurrent.duration._
 
-import org.specs2.specification.core.{ Fragments, Fragment }
+abstract class ClientRouteTestBattery(name: String) extends Http4sSpec with Http4sClientDsl[IO] {
+  val timeout = 20.seconds
+  var address: InetSocketAddress = null
 
-import scalaz.concurrent.Task
-import scalaz.stream.Process
+  def clientResource: Resource[IO, Client[IO]]
 
-
-abstract class ClientRouteTestBattery(name: String, client: Client)
-  extends JettyScaffold(name) with GetRoutes
-{
-  // Travis has been timing out intermittently.  Let's see if having All The Threads helps.
-  sequential
-  isolated
-
-  override def cleanup() = {
-    super.cleanup() // shuts down the jetty server
-    client.shutdown.run
-  }
-
-  override def runAllTests(): Fragments = {
-    val address = initializeServer()
-    val gets = translateTests(address, Method.GET, getPaths)
-    val frags = gets.map { case (req, resp) => runTest(req, resp, address) }
-                    .toSeq
-                    .foldLeft(Fragments())(_ append _)
-
-    frags
-  }
-
-  override def testServlet() = new HttpServlet {
-    override def doGet(req: HttpServletRequest, srv: HttpServletResponse) {
-      getPaths.get(req.getRequestURI) match {
+  def testServlet = new HttpServlet {
+    override def doGet(req: HttpServletRequest, srv: HttpServletResponse): Unit =
+      GetRoutes.getPaths.get(req.getRequestURI) match {
         case Some(r) => renderResponse(srv, r)
-        case None    => srv.sendError(404)
+        case None => srv.sendError(404)
+      }
+
+    override def doPost(req: HttpServletRequest, srv: HttpServletResponse): Unit = {
+      srv.setStatus(200)
+      val s = scala.io.Source.fromInputStream(req.getInputStream).mkString
+      srv.getOutputStream.print(s)
+      srv.getOutputStream.flush()
+    }
+  }
+
+  withResource(JettyScaffold[IO](1, false, testServlet)) { jetty =>
+    withResource(clientResource) { client =>
+      val address = jetty.addresses.head
+
+      Fragments.foreach(GetRoutes.getPaths.toSeq) {
+        case (path, expected) =>
+          s"Execute GET: $path" in {
+            val name = address.getHostName
+            val port = address.getPort
+            val req = Request[IO](uri = Uri.fromString(s"http://$name:$port$path").yolo)
+            client
+              .fetch(req)(resp => checkResponse(resp, expected))
+              .unsafeRunTimed(timeout)
+              .get
+          }
+      }
+
+      name should {
+        "Strip fragments from URI" in {
+          skipped("Can only reproduce against external resource.  Help wanted.")
+          val uri = Uri.uri("https://en.wikipedia.org/wiki/Buckethead_discography#Studio_albums")
+          val body = client.fetch(Request[IO](uri = uri))(e => IO.pure(e.status))
+          body must returnValue(Ok)
+        }
+
+        "Repeat a simple request" in {
+          val path = GetRoutes.SimplePath
+
+          def fetchBody = client.toKleisli(_.as[String]).local { uri: Uri =>
+            Request(uri = uri)
+          }
+
+          val url = Uri.fromString(s"http://${address.getHostName}:${address.getPort}$path").yolo
+          (0 until 10).toVector
+            .parTraverse(_ => fetchBody.run(url).map(_.length))
+            .unsafeRunTimed(timeout)
+            .forall(_ mustNotEqual 0)
+        }
+
+        "POST an empty body" in {
+          val uri = Uri.fromString(s"http://${address.getHostName}:${address.getPort}/echo").yolo
+          val req = POST(uri)
+          val body = client.expect[String](req)
+          body must returnValue("")
+        }
+
+        "POST a normal body" in {
+          val uri = Uri.fromString(s"http://${address.getHostName}:${address.getPort}/echo").yolo
+          val req = POST("This is normal.", uri)
+          val body = client.expect[String](req)
+          body must returnValue("This is normal.")
+        }
+
+        "POST a chunked body" in {
+          val uri = Uri.fromString(s"http://${address.getHostName}:${address.getPort}/echo").yolo
+          val req = POST(Stream("This is chunked.").covary[IO], uri)
+          val body = client.expect[String](req)
+          body must returnValue("This is chunked.")
+        }
+
+        "POST a multipart body" in {
+          val uri = Uri.fromString(s"http://${address.getHostName}:${address.getPort}/echo").yolo
+          val multipart = Multipart[IO](Vector(Part.formData("text", "This is text.")))
+          val req = POST(multipart, uri).map(_.withHeaders(multipart.headers))
+          val body = client.expect[String](req)
+          body must returnValue(containing("This is text."))
+        }
       }
     }
   }
 
-  private def runTest(req: Request, expected: Response, address: InetSocketAddress): Fragment = {
-    s"Execute ${req.method}: ${req.uri}" in {
-      runTest(req, address) { resp =>
-        Task.delay(checkResponse(resp, expected))
-      }
-    }
-  }
-
-  private def runTest[A](req: Request, address: InetSocketAddress)(f: Response => Task[A]): A = {
-    val newreq = req.copy(uri = req.uri.copy(authority = Some(Authority(host = RegName(address.getHostName),
-      port = Some(address.getPort)))))
-    client.fetch(newreq)(f).runFor(timeout)
-  }
-
-  private def checkResponse(rec: Response, expected: Response) = {
+  private def checkResponse(rec: Response[IO], expected: Response[IO]): IO[Boolean] = {
     val hs = rec.headers.toSeq
-
-    rec.status must be_==(expected.status)
-
-    collectBody(rec.body) must be_==(collectBody(expected.body))
-
-    expected.headers.foreach(h => h must beOneOf(hs:_*))
-
-    rec.httpVersion must be_==(expected.httpVersion)
+    for {
+      _ <- IO(rec.status must be_==(expected.status))
+      body <- rec.body.compile.to[Array]
+      expBody <- expected.body.compile.to[Array]
+      _ <- IO(body must_== expBody)
+      _ <- IO(expected.headers.foreach(h => h must beOneOf(hs: _*)))
+      _ <- IO(rec.httpVersion must be_==(expected.httpVersion))
+    } yield true
   }
 
-  private def translateTests(address: InetSocketAddress, method: Method, paths: Map[String, Response]): Map[Request, Response] = {
-    val port = address.getPort()
-    val name = address.getHostName()
-    paths.map { case (s, r) =>
-      (Request(method, uri = Uri.fromString(s"http://$name:$port$s").yolo), r)
-    }
-  }
-
-  private def renderResponse(srv: HttpServletResponse, resp: Response): Unit = {
+  private def renderResponse(srv: HttpServletResponse, resp: Response[IO]): Unit = {
     srv.setStatus(resp.status.code)
     resp.headers.foreach { h =>
       srv.addHeader(h.name.toString, h.value)
     }
-
-    val os = srv.getOutputStream
-    resp.body.flatMap { body =>
-      os.write(body.toArray)
-      os.flush()
-      Process.halt.asInstanceOf[Process[Task, Unit]]
-    }.run.run
+    resp.body
+      .through(
+        writeOutputStream[IO](
+          IO.pure(srv.getOutputStream),
+          testBlockingExecutionContext,
+          closeAfterUse = false))
+      .compile
+      .drain
+      .unsafeRunSync()
   }
-
-  private def collectBody(body: EntityBody): Array[Byte] = body.runLog.run.toArray.map(_.toArray).flatten
 }

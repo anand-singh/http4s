@@ -1,98 +1,107 @@
 package org.http4s
 package server
 
+import cats.implicits._
+import cats.effect._
+import cats.effect.concurrent.Ref
+import fs2._
+import fs2.concurrent.{Signal, SignallingRef}
 import java.net.{InetAddress, InetSocketAddress}
-import java.util.concurrent.ExecutorService
+import javax.net.ssl.SSLContext
+import org.http4s.internal.BackendBuilder
+import org.http4s.server.SSLKeyStoreSupport.StoreInfo
+import scala.collection.immutable
 
-import com.codahale.metrics.MetricRegistry
-import org.http4s.server.SSLSupport.StoreInfo
+trait ServerBuilder[F[_]] extends BackendBuilder[F, Server[F]] {
+  type Self <: ServerBuilder[F]
 
-import scala.concurrent.duration._
-import scalaz.concurrent.{Strategy, Task}
-
-trait ServerBuilder {
-  import ServerBuilder._
-
-  type Self <: ServerBuilder
+  protected implicit def F: Concurrent[F]
 
   def bindSocketAddress(socketAddress: InetSocketAddress): Self
 
-  final def bindHttp(port: Int = DefaultHttpPort, host: String = DefaultHost) =
+  final def bindHttp(port: Int = defaults.HttpPort, host: String = defaults.Host): Self =
     bindSocketAddress(InetSocketAddress.createUnresolved(host, port))
 
-  final def bindLocal(port: Int) = bindHttp(port, DefaultHost)
+  final def bindLocal(port: Int): Self = bindHttp(port, defaults.Host)
 
-  final def bindAny(host: String = DefaultHost) = bindHttp(0, host)
+  final def bindAny(host: String = defaults.Host): Self = bindHttp(0, host)
 
-  def withServiceExecutor(executorService: ExecutorService): Self
-
-  def mountService(service: HttpService, prefix: String = ""): Self
-
-  /** Returns a task to start a server.  The task completes with a
-    * reference to the server when it has started.
+  /** Sets the handler for errors thrown invoking the service.  Is not
+    * guaranteed to be invoked on errors on the server backend, such as
+    * parsing a request or handling a context timeout.
     */
-  def start: Task[Server]
+  def withServiceErrorHandler(serviceErrorHandler: ServiceErrorHandler[F]): Self
 
-  /** Convenience method to run a server.  The method blocks
-    * until the server is started.
+  /** Returns a Server resource.  The resource is not acquired until the
+    * server is started and ready to accept requests.
     */
-  final def run: Server =
-    start.run
+  def resource: Resource[F, Server[F]]
+
+  /**
+    * Runs the server as a process that never emits.  Useful for a server
+    * that runs for the rest of the JVM's life.
+    */
+  final def serve: Stream[F, ExitCode] =
+    for {
+      signal <- Stream.eval(SignallingRef[F, Boolean](false))
+      exitCode <- Stream.eval(Ref[F].of(ExitCode.Success))
+      serve <- serveWhile(signal, exitCode)
+    } yield serve
+
+  /**
+    * Runs the server as a Stream that emits only when the terminated signal becomes true.
+    * Useful for servers with associated lifetime behaviors.
+    */
+  final def serveWhile(
+      terminateWhenTrue: Signal[F, Boolean],
+      exitWith: Ref[F, ExitCode]): Stream[F, ExitCode] =
+    Stream.resource(resource) *> (terminateWhenTrue.discrete
+      .takeWhile(_ === false)
+      .drain ++ Stream.eval(exitWith.get))
+
+  /** Set the banner to display when the server starts up */
+  def withBanner(banner: immutable.Seq[String]): Self
+
+  /** Disable the banner when the server starts up */
+  final def withoutBanner: Self = withBanner(immutable.Seq.empty)
 }
 
 object ServerBuilder {
-  // Defaults for core server builder functionality
+  @deprecated("Use InetAddress.getLoopbackAddress.getHostAddress", "0.20.0-M2")
   val LoopbackAddress = InetAddress.getLoopbackAddress.getHostAddress
-  val DefaultHost = LoopbackAddress
-  val DefaultHttpPort = 8080
-  val DefaultSocketAddress = InetSocketAddress.createUnresolved(DefaultHost, DefaultHttpPort)
-  val DefaultServiceExecutor = Strategy.DefaultExecutorService
+  @deprecated("Use org.http4s.server.defaults.Host", "0.20.0-M2")
+  val DefaultHost = defaults.Host
+  @deprecated("Use org.http4s.server.defaults.HttpPort", "0.20.0-M2")
+  val DefaultHttpPort = defaults.HttpPort
+  @deprecated("Use org.http4s.server.defaults.SocketAddress", "0.20.0-M2")
+  val DefaultSocketAddress = defaults.SocketAddress
+  @deprecated("Use org.http4s.server.defaults.Banner", "0.20.0-M2")
+  val DefaultBanner = defaults.Banner
 }
 
-trait IdleTimeoutSupport { this: ServerBuilder =>
-  def withIdleTimeout(idleTimeout: Duration): Self
-}
 object IdleTimeoutSupport {
-  val DefaultIdleTimeout = 30.seconds
+  @deprecated("Moved to org.http4s.server.defaults.IdleTimeout", "0.20.0-M2")
+  val DefaultIdleTimeout = defaults.IdleTimeout
 }
 
-trait AsyncTimeoutSupport { this: ServerBuilder =>
-  def withAsyncTimeout(asyncTimeout: Duration): Self
-}
 object AsyncTimeoutSupport {
-  val DefaultAsyncTimeout = 30.seconds
+  @deprecated("Moved to org.http4s.server.defaults.AsyncTimeout", "0.20.0-M2")
+  val DefaultAsyncTimeout = defaults.AsyncTimeout
 }
 
-trait SSLSupport { this: ServerBuilder =>
-  def withSSL(keyStore: StoreInfo,
+sealed trait SSLConfig
+
+final case class KeyStoreBits(
+    keyStore: StoreInfo,
     keyManagerPassword: String,
-              protocol: String = "TLS",
-            trustStore: Option[StoreInfo] = None,
-            clientAuth: Boolean = false): Self
-}
-object SSLSupport {
-  case class StoreInfo(path: String, password: String)
-  case class SSLBits(keyStore: StoreInfo,
-           keyManagerPassword: String,
-                     protocol: String,
-                   trustStore: Option[StoreInfo],
-                   clientAuth: Boolean)
-}
+    protocol: String,
+    trustStore: Option[StoreInfo],
+    clientAuth: SSLClientAuthMode)
+    extends SSLConfig
 
-trait MetricsSupport { this: ServerBuilder =>
-  /**
-   * Triggers collection of backend-specific Metrics into the specified [[MetricRegistry]].
-   */
-  def withMetricRegistry(metricRegistry: MetricRegistry): Self
+final case class SSLContextBits(sslContext: SSLContext, clientAuth: SSLClientAuthMode)
+    extends SSLConfig
 
-  /** Sets the prefix for metrics gathered by the server.*/
-  def withMetricPrefix(metricPrefix: String): Self
-}
-object MetricsSupport {
-  val DefaultPrefix = "org.http4s.server"
-}
-
-trait WebSocketSupport { this: ServerBuilder =>
-  /* Enable websocket support */
-  def withWebSockets(enableWebsockets: Boolean): Self
+object SSLKeyStoreSupport {
+  final case class StoreInfo(path: String, password: String)
 }

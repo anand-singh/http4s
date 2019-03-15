@@ -1,172 +1,105 @@
 ---
-layout: default
-title: Getting started
+title: Quick Start
+menu: main
+weight: 1
 ---
 
-This tutorial will walk you through creating your first http4s service
-and calling it with http4s' client.
+**Note**: To run examples, please make sure that the flag `-Ypartial-unification`  
+is enabled in your compiler options (i.e `scalacOptions += "-Ypartial-unification"` in sbt).
+This is enabled by default in the giter8 template.
 
-Create a new directory, with the following build.sbt in the root:
 
-```scala
-scalaVersion := "2.11.8" // Also supports 2.10.x
+Getting started with http4s is easy.  Let's materialize an http4s
+skeleton project from its [giter8 template]:
 
-lazy val http4sVersion = "0.14.0-SNAPSHOT"
-
-// Only necessary for SNAPSHOT releases
-resolvers += Resolver.sonatypeRepo("snapshots")
-
-libraryDependencies ++= Seq(
-  "org.http4s" %% "http4s-dsl" % http4sVersion,
-  "org.http4s" %% "http4s-blaze-server" % http4sVersion,
-  "org.http4s" %% "http4s-blaze-client" % http4sVersion
-)
+```sbt
+$ sbt -sbt-version 1.2.1 new http4s/http4s.g8 -b 0.19
 ```
 
-This tutorial is compiled as part of the build using [tut].  Each page
-is its own REPL session.  If you copy and paste code samples starting
-from the top, you should be able to follow along in a REPL.
+Follow the prompts.  For every step along the way, a default value is
+provided in brackets.
+
+`name`
+: name of your project.
+
+`organization`
+: the organization you publish under.  It's common practice on the JVM
+to make this a domain you own, in reverse order (i.e., TLD first).
+`io.github.username` is also a fine choice.
+
+`package`
+: by default, your organization followed by the project name.
+
+`sbt_version`
+: the version of SBT for your generated project.
+
+`scala_version`
+: the version of Scala for your generated project. 
+
+`http4s_version`
+: defaults to the latest stable release of http4s.  See
+  the [versions] page for other suggestions.
+
+`logback_version`
+: the version of Logback for logging in your generated project.
+
+At the end of the process, you'll see:
 
 ```
-$ sbt console
+Template applied in ./quickstart
 ```
 
-## Your first service
+In addition to sbt build machinery, some Scala source files are
+generated:
 
-An `HttpService` is a simple alias for
-`Kleisli[Task, Request, Response]`.  If that's meaningful to you,
-great.  If not, don't panic: `Kleisli` is just a convenient wrapper
-around a `Request => Task[Response]`, and `Task` is an asynchronous
-operation.  We'll teach you what you need to know as we go, or you
-can, uh, fork a task to read these introductions first:
-
-* [Scalaz Task: The Missing Documentation]
-* [Kleisli: Composing monadic functions]
-
-### Defining your service
-
-Wherever you are in your studies, let's create our first
-`HttpService`.  Start by pasting these imports into your SBT console:
-
-```tut:book
-import org.http4s._, org.http4s.dsl._
+```sh
+$ cd quickstart
+$ find src/main -name '*.scala'
+./src/main/scala/com/example/http4squickstart/HelloWorldServer.scala
+./src/main/scala/com/example/http4squickstart/HelloWorldService.scala
 ```
 
-Using the http4s-dsl, we can construct an `HttpService` by pattern
-matching the request.  Let's build a service that matches requests to
-`GET /hello/:name`, where `:name` is a path parameter for the person to
-greet.
+`HelloWorldServer.scala` defines a runnable object `HelloWorldServer extends StreamApp[IO]`
+ overriding the `stream(args: List[String],
+requestShutdown: IO[Unit])` method which acts as the entry point to your application by
+ starting blaze, http4s' native server backend.
 
-```tut:book
-val service = HttpService {
-  case GET -> Root / "hello" / name =>
-    Ok(s"Hello, $name.")
-}
+`HelloWorldService` defines a `service` value containing a simple `HttpService` that responds to `GET
+/hello/$USERNAME` with a JSON greeting.  Let's try it:
+
+```sh
+$ sbt run
 ```
 
-### Running your service
+Depending on the state of your Ivy cache, several dependencies will
+download.  This is a good time to grab a beverage.  When you come
+back, you should see a line similar to this:
 
-http4s supports multiple server backends.  In this example, we'll use
-[blaze], the native backend supported by http4s.
-
-We start from a `BlazeBuilder`, and then mount a service.  The
-`BlazeBuilder` is immutable with chained methods, each returning
-a new builder.
-
-```tut:book
-import org.http4s.server.blaze._
-
-val builder = BlazeBuilder.mountService(service)
+```
+264 [run-main-0] INFO org.http4s.blaze.channel.nio1.NIO1SocketServerGroup - Service bound to address /127.0.0.1:8080
 ```
 
-A builder can be `run` to start the server.  By default, http4s
-servers bind to port 8080.
+This indicates that blaze is running our service on port 8080. Let's try out the
+hello world service with curl:
 
-```tut:book
-val server = builder.run
+```sh
+$ curl -i http://localhost:8080/hello/world
+HTTP/1.1 200 OK
+Content-Type: application/json; charset=UTF-8
+Date: Thu, 01 Dec 2016 05:05:24 GMT
+Content-Length: 26
+
+{"message":"Hello, world"}
 ```
 
-## Your first client
+To shut down your server, simply press `^C` in your console. Note that
+when running interactive SBT, `^C` will kill the SBT process. For rapid
+application development, you may wish to add the [sbt-revolver] plugin
+to your project and starting the server from the SBT prompt with `reStart`.
 
-How do we know the server is running?  Let's create a client with
-http4s to try our service.
+With just a few commands, we have a fully functional app for creating
+a simple JSON service.
 
-### Creating the client
-
-A good default choice is the `PooledHttp1Client`.  As the name
-implies, the `PooledHttp1Client` maintains a connection pool and
-speaks HTTP 1.x.
-
-```tut:book
-import org.http4s.client.blaze._
-
-val client = PooledHttp1Client()
-```
-
-### Describing a call
-
-To execute a GET request, we can call `getAs` with the type we expect
-and the URI we want:
-
-```tut:book
-val helloJames = client.getAs[String]("http://localhost:8080/hello/James")
-```
-
-Note that we don't have any output yet.  We have a `Task[String]`, to
-represent the asynchronous nature of a client request.
-
-Furthermore, we haven't even executed the request yet.  A significant
-difference between a `Task` and a `scala.concurrent.Future` is that a
-`Future` starts running immediately on its implicit execution context,
-whereas a `Task` runs when it's told.  Executing a request is an
-example of a side effect.  In functional programming, we prefer to
-build a description of the program we're going to run, and defer its
-side effects to the end.
-
-Let's describe how we're going to greet a collection of people in
-parallel:
-
-```tut:book
-import scalaz.concurrent.Task
-
-def hello(name: String): Task[String] = {
-  val target = uri("http://localhost:8080/hello/") / name
-  client.getAs[String](target)
-}
-
-val people = Vector("Michael", "Jessica", "Ashley", "Christopher")
-
-val greetingList = Task.gatherUnordered(people.map(hello))
-```
-
-Observe how simply we could combine a single `Task[String]` returned
-by `hello` into a scatter-gather to return a `Task[List[String]]`.
-
-## Making the call
-
-It is best to run your `Task` "at the end of the world."  The "end of
-the world" varies by context:
-
-* In a command line app, it's your main method.
-* In an `HttpService`, a `Task[Response]` is returned to be run by the
-  server.
-* Here in the REPL, the last line is the end of the world.  Here we go:
-
-```tut:book
-greetingList.run.mkString("\n")
-```
-
-## Cleaning up
-
-Both our client and our server consume system resources.  Let's clean
-up after ourselves by shutting each down:
-
-```tut:book
-client.shutdownNow()
-server.shutdownNow()
-```
-
-[blaze]: https://github.com/http4s/blaze
-[tut]: https://github.com/tpolecat/tut
-[Kleisli: Composing monadic functions]: http://eed3si9n.com/learning-scalaz/Composing+monadic+functions.html
-[Scalaz Task: The Missing Documentation]: http://timperrett.com/2014/07/20/scalaz-task-the-missing-documentation/
+[giter8 template]: https://github.com/http4s/http4s.g8
+[versions]: /versions/
+[sbt-revolver]: https://github.com/spray/sbt-revolver

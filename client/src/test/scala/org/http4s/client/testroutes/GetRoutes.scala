@@ -1,20 +1,33 @@
-package org.http4s.client.testroutes
+package org.http4s
+package client.testroutes
 
+import cats.effect._
+import cats.implicits._
+import fs2._
 import org.http4s.Status._
-import org.http4s.{TransferCoding, Response}
+import scala.concurrent.duration._
 
-import scalaz.stream.Process
+object GetRoutes {
+  val SimplePath = "/simple"
+  val ChunkedPath = "/chunked"
+  val DelayedPath = "/delayed"
+  val NoContentPath = "/no-content"
+  val NotFoundPath = "/not-found"
+  val EmptyNotFoundPath = "/empty-not-found"
+  val InternalServerErrorPath = "/internal-server-error"
 
-trait GetRoutes {
-
-  /////////////// Test routes for clients ////////////////////////////////
-
-  protected val getPaths: Map[String, Response] = {
-    import org.http4s.headers._
+  def getPaths(implicit timer: Timer[IO]): Map[String, Response[IO]] =
     Map(
-      "/simple" -> Response(Ok).withBody("simple path").run,
-      "/chunked" -> Response(Ok).withBody(Process.emit("chunk1")).map(_.putHeaders(`Transfer-Encoding`(TransferCoding.chunked))).run
-    )
-  }
-
+      SimplePath -> Response[IO](Ok).withEntity("simple path").pure[IO],
+      ChunkedPath -> Response[IO](Ok)
+        .withEntity(Stream.emits("chunk".toSeq.map(_.toString)).covary[IO])
+        .pure[IO],
+      DelayedPath ->
+        timer.sleep(1.second) *>
+          Response[IO](Ok).withEntity("delayed path").pure[IO],
+      NoContentPath -> Response[IO](NoContent).pure[IO],
+      NotFoundPath -> Response[IO](NotFound).withEntity("not found").pure[IO],
+      EmptyNotFoundPath -> Response[IO](NotFound).pure[IO],
+      InternalServerErrorPath -> Response[IO](InternalServerError).pure[IO]
+    ).mapValues(_.unsafeRunSync())
 }

@@ -1,46 +1,42 @@
 package com.example.http4s.blaze
 
-object ClientExample {
+import cats.effect._
+import cats.implicits._
+import io.circe.generic.auto._
+import org.http4s.Uri
+import org.http4s.Status.{NotFound, Successful}
+import org.http4s.circe._
+import org.http4s.client.Client
+import org.http4s.client.blaze.BlazeClientBuilder
+import scala.concurrent.ExecutionContext.global
 
-  def getSite() = {
+object ClientExample extends IOApp {
 
-/// code_ref: blaze_client_example
-    import org.http4s.Http4s._
-    import scalaz.concurrent.Task
-
-    val client = org.http4s.client.blaze.SimpleHttp1Client()
-
-    val page: Task[String] = client.expect[String](uri("https://www.google.com/"))
+  def getSite(client: Client[IO]): IO[Unit] = IO {
+    val page: IO[String] = client.expect[String](Uri.uri("https://www.google.com/"))
 
     for (_ <- 1 to 2)
-      println(page.map(_.take(72)).run)   // each execution of the Task will refetch the page!
+      println(page.map(_.take(72)).unsafeRunSync()) // each execution of the effect will refetch the page!
 
     // We can do much more: how about decoding some JSON to a scala object
     // after matching based on the response status code?
-    import org.http4s.Status.NotFound
-    import org.http4s.Status.ResponseClass.Successful
-    import io.circe._
-    import io.circe.generic.auto._
-    import org.http4s.circe.jsonOf
 
-    case class Foo(bar: String)
-
-    // jsonOf is defined for Json4s, Argonuat, and Circe, just need the right decoder!
-    implicit val fooDecoder = jsonOf[Foo]
+    final case class Foo(bar: String)
 
     // Match on response code!
-    val page2 = client.get(uri("http://http4s.org/resources/foo.json")) {
-      case Successful(resp) => resp.as[Foo].map("Received response: " + _)
-      case NotFound(resp)   => Task.now("Not Found!!!")
-      case resp             => Task.now("Failed: " + resp.status)
+    val page2 = client.get(Uri.uri("http://http4s.org/resources/foo.json")) {
+      case Successful(resp) =>
+        // decodeJson is defined for Json4s, Argonuat, and Circe, just need the right decoder!
+        resp.decodeJson[Foo].map("Received response: " + _)
+      case NotFound(_) => IO.pure("Not Found!!!")
+      case resp => IO.pure("Failed: " + resp.status)
     }
 
-    println(page2.run)
-
-    client.shutdownNow()
-/// end_code_ref
+    println(page2.unsafeRunSync())
   }
 
-  def main(args: Array[String]): Unit = getSite()
-
+  def run(args: List[String]): IO[ExitCode] =
+    BlazeClientBuilder[IO](global).resource
+      .use(getSite)
+      .as(ExitCode.Success)
 }

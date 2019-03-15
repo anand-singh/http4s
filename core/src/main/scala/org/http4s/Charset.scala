@@ -18,12 +18,14 @@
  */
 package org.http4s
 
-import java.nio.charset.{Charset => NioCharset, StandardCharsets}
+import java.nio.charset.{StandardCharsets, Charset => NioCharset}
+import java.util.{HashMap, Locale}
 import org.http4s.util._
-import scalaz.\/
+import scala.collection.JavaConverters._
 
 final case class Charset private (nioCharset: NioCharset) extends Renderable {
-  def satisfies(charsetRange: CharsetRange): Boolean = charsetRange isSatisfiedBy this
+  @deprecated("Use `Accept-Charset`.isSatisfiedBy(charset)", "0.16.1")
+  def satisfies(charsetRange: CharsetRange): Boolean = charsetRange.isSatisfiedBy(this)
 
   def withQuality(q: QValue): CharsetRange.Atom = CharsetRange.Atom(this, q)
   def toRange: CharsetRange.Atom = withQuality(QValue.One)
@@ -32,18 +34,30 @@ final case class Charset private (nioCharset: NioCharset) extends Renderable {
 }
 
 object Charset {
-  val `US-ASCII`     = Charset(StandardCharsets.US_ASCII)
-  val `ISO-8859-1`   = Charset(StandardCharsets.ISO_8859_1)
-  val `UTF-8`        = Charset(StandardCharsets.UTF_8)
-  val `UTF-16`       = Charset(StandardCharsets.UTF_16)
-  val `UTF-16BE`     = Charset(StandardCharsets.UTF_16BE)
-  val `UTF-16LE`     = Charset(StandardCharsets.UTF_16LE)
+  val `US-ASCII` = Charset(StandardCharsets.US_ASCII)
+  val `ISO-8859-1` = Charset(StandardCharsets.ISO_8859_1)
+  val `UTF-8` = Charset(StandardCharsets.UTF_8)
+  val `UTF-16` = Charset(StandardCharsets.UTF_16)
+  val `UTF-16BE` = Charset(StandardCharsets.UTF_16BE)
+  val `UTF-16LE` = Charset(StandardCharsets.UTF_16LE)
+
+  // Charset.forName caches a whopping two values and then
+  // synchronizes.  We can prevent this by pre-caching all the lookups
+  // that will succeed.
+  private val cache: HashMap[String, NioCharset] = {
+    val map = new HashMap[String, NioCharset]
+    for {
+      cs <- NioCharset.availableCharsets.values.asScala
+      name <- cs.name :: cs.aliases.asScala.toList
+    } map.put(name.toLowerCase(Locale.ROOT), cs)
+    map
+  }
 
   def fromNioCharset(nioCharset: NioCharset): Charset = Charset(nioCharset)
 
   def fromString(name: String): ParseResult[Charset] =
-    \/.fromTryCatchNonFatal(NioCharset.forName(name)).bimap(
-      _ => ParseFailure("Invalid charset", s"$name is not a supported Charset"),
-      Charset.apply
-    )
+    cache.get(name.toLowerCase(Locale.ROOT)) match {
+      case nioCharset: NioCharset => Right(Charset.apply(nioCharset))
+      case null => Left(ParseFailure("Invalid charset", s"$name is not a supported Charset"))
+    }
 }

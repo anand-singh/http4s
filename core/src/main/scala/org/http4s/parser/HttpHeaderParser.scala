@@ -19,44 +19,46 @@ package org.http4s
 package parser
 
 import java.util
-
+import java.lang.reflect.InvocationTargetException
 import org.http4s.util.CaseInsensitiveString
+import org.http4s.Header.Parsed
+import org.http4s.syntax.string._
 
-import Header.Parsed
-import org.http4s.util.string._
-
-
-object HttpHeaderParser extends SimpleHeaders
-                    with AcceptHeader
-                    with AcceptLanguageHeader
-                    with CacheControlHeader
-                    with ContentTypeHeader
-                    with CookieHeader
-                    with AcceptCharsetHeader
-                    with AcceptEncodingHeader
-                    with AuthorizationHeader
-                    with RangeParser
-                    with LocationHeader
-                    with ProxyAuthenticateHeader
-                    with WwwAuthenticateHeader {
-
+object HttpHeaderParser
+    extends SimpleHeaders
+    with AcceptCharsetHeader
+    with AcceptEncodingHeader
+    with AcceptHeader
+    with AcceptLanguageHeader
+    with AuthorizationHeader
+    with CacheControlHeader
+    with ContentTypeHeader
+    with CookieHeader
+    with LinkHeader
+    with LocationHeader
+    with OriginHeader
+    with ProxyAuthenticateHeader
+    with RangeParser
+    with RefererHeader
+    with StrictTransportSecurityHeader
+    with WwwAuthenticateHeader
+    with ZipkinHeader {
   type HeaderParser = String => ParseResult[Parsed]
 
-  private val allParsers = new util.concurrent.ConcurrentHashMap[CaseInsensitiveString, HeaderParser]
-
+  private val allParsers =
+    new util.concurrent.ConcurrentHashMap[CaseInsensitiveString, HeaderParser]
 
   // Constructor
   gatherBuiltIn()
 
   /** Add a parser to the global header parser registry
-    * 
+    *
     * @param key name of the header to register the parser for
     * @param parser [[Header]] parser
     * @return any existing parser already registered to that key
     */
   def addParser(key: CaseInsensitiveString, parser: HeaderParser): Option[HeaderParser] =
     Option(allParsers.put(key, parser))
-
 
   /** Remove the parser for the specified header key
     *
@@ -66,18 +68,27 @@ object HttpHeaderParser extends SimpleHeaders
   def dropParser(key: CaseInsensitiveString): Option[HeaderParser] =
     Option(allParsers.remove(key))
 
-  def parseHeader(header: Header.Raw): ParseResult[Header] = {
+  def parseHeader(header: Header.Raw): ParseResult[Header] =
     allParsers.get(header.name) match {
-      case null =>  ParseResult.success(header) // if we don't have a rule for the header we leave it unparsed
-      case parser => parser(header.value)
+      case null =>
+        ParseResult.success(header) // if we don't have a rule for the header we leave it unparsed
+      case parser =>
+        try parser(header.value)
+        catch {
+          // We need a way to bail on invalid dates without throwing.  There should be a better way.
+          case _: ParseFailure =>
+            ParseResult.success(header)
+          case e: InvocationTargetException if e.getCause.isInstanceOf[ParseFailure] =>
+            // TODO curse this runtime reflection
+            ParseResult.success(header)
+        }
     }
-  }
 
   /**
-   * Warm up the header parsers by triggering the loading of most classes in this package,
-   * so as to increase the speed of the first usage.
-   */
-  def warmUp() {
+    * Warm up the header parsers by triggering the loading of most classes in this package,
+    * so as to increase the speed of the first usage.
+    */
+  def warmUp(): Unit = {
     val results = List(
       Header("Accept", "*/*,text/plain,custom/custom"),
       Header("Accept-Charset", "*,UTF-8"),
@@ -93,22 +104,21 @@ object HttpHeaderParser extends SimpleHeaders
       Header("Cookie", "http4s=cool"),
       Header("Host", "http4s.org"),
       Header("X-Forwarded-For", "1.2.3.4"),
-      Header("Fancy-Custom-Header", "yeah")
-    ) map parseHeader
+      Header("Fancy-Custom-Header", "yeah"),
+      Header("Origin", "http://example.com:12345")
+    ).map(parseHeader)
     assert(results.forall(_.isRight))
   }
 
   private def gatherBuiltIn(): Unit =
-    this
-      .getClass
-      .getMethods
+    this.getClass.getMethods
       .filter(_.getName.forall(!_.isLower)) // only the header rules have no lower-case letter in their name
       .foreach { method =>
-      val key = method.getName.replace('_', '-').ci
-      val parser ={ value: String =>
-        method.invoke(this, value)
-      }.asInstanceOf[HeaderParser]
+        val key = method.getName.replace('_', '-').ci
+        val parser = { value: String =>
+          method.invoke(this, value)
+        }.asInstanceOf[HeaderParser]
 
-      addParser(key, parser)
-    }
+        addParser(key, parser)
+      }
 }

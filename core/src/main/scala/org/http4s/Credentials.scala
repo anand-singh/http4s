@@ -18,78 +18,76 @@
  */
 package org.http4s
 
+import cats.data.NonEmptyList
 import java.nio.charset.StandardCharsets
 import java.util.Base64
-
 import org.http4s.util.{Renderable, Writer}
 
 sealed abstract class Credentials extends Renderable {
   def authScheme: AuthScheme
-  def value: String
 }
 
-case class BasicCredentials(username: String, password: String) extends Credentials {
-  val authScheme = AuthScheme.Basic
-
-  override lazy val value = {
-    val userPass = username + ':' + password
-    val bytes = userPass.getBytes(StandardCharsets.ISO_8859_1)
-    val cookie = Base64.getEncoder.encodeToString(bytes)
-    "Basic " + cookie
+object Credentials {
+  final case class Token(authScheme: AuthScheme, token: String) extends Credentials {
+    def render(writer: Writer): writer.type =
+      writer << authScheme << ' ' << token
   }
 
-  override def render(writer: Writer): writer.type = writer.append(value)
+  final case class AuthParams(authScheme: AuthScheme, params: NonEmptyList[(String, String)])
+      extends Credentials {
+    def render(writer: Writer): writer.type = {
+      writer << authScheme
+      writer << ' '
+
+      def renderParam(k: String, v: String) = {
+        writer << k << '='
+        writer.quote(v)
+        ()
+      }
+      renderParam(params.head._1, params.head._2)
+      params.tail.foreach {
+        case (k, v) =>
+          writer.append(',')
+          renderParam(k, v)
+      }
+      writer
+    }
+  }
+
+  object AuthParams {
+    def apply(
+        authScheme: AuthScheme,
+        param: (String, String),
+        params: (String, String)*): AuthParams =
+      apply(authScheme, NonEmptyList(param, params.toList))
+  }
+}
+
+final case class BasicCredentials(username: String, password: String) {
+  lazy val token = {
+    val userPass = username + ':' + password
+    val bytes = userPass.getBytes(StandardCharsets.ISO_8859_1)
+    Base64.getEncoder.encodeToString(bytes)
+  }
 }
 
 object BasicCredentials {
-  def apply(credentials: String): BasicCredentials = {
-    val bytes = Base64.getDecoder.decode(credentials)
+  def apply(token: String): BasicCredentials = {
+    val bytes = Base64.getDecoder.decode(token)
     val userPass = new String(bytes, StandardCharsets.ISO_8859_1)
     userPass.indexOf(':') match {
       case -1 => apply(userPass, "")
       case ix => apply(userPass.substring(0, ix), userPass.substring(ix + 1))
     }
   }
-}
 
-
-case class OAuth2BearerToken(token: String) extends Credentials {
-  val authScheme = AuthScheme.Bearer
-
-  override def value = renderString
-
-  override def render(writer: Writer): writer.type = writer.append("Bearer ").append(token)
-}
-
-
-case class GenericCredentials(authScheme: AuthScheme, params: Map[String, String]) extends Credentials {
-  override lazy val value = renderString
-
-  override def render(writer: Writer): writer.type = {
-    writer << authScheme
-    if (params.nonEmpty) {
-      writer << ' '
-      formatParams(writer)
-    }
-    writer
-  }
-
-  private def formatParams(sb: Writer): Unit = {
-    var first = true
-    params.foreach { case (k, v) =>
-      if (first) first = false
-      else sb.append(',')
-
-      if (k.isEmpty) sb << '"'
-      else sb<< k << '=' << '"'
-
-      v.foreach {
-        case '"' => sb << '\\' << '"'
-        case '\\' => sb << '\\' << '\\'
-        case c => sb << c
+  def unapply(creds: Credentials): Option[(String, String)] =
+    creds match {
+      case Credentials.Token(AuthScheme.Basic, token) => {
+        val basicCredentials = BasicCredentials(token)
+        Some((basicCredentials.username, basicCredentials.password))
       }
-      sb << '"'
+      case _ =>
+        None
     }
-  }
 }
-

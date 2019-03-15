@@ -2,7 +2,10 @@ package org.http4s
 package server
 package middleware
 
-import scalaz.concurrent.Task
+import cats.data.Kleisli
+import cats.effect._
+import cats.implicits._
+import cats.~>
 
 /** [[Middleware]] for lifting application/x-www-form-urlencoded bodies into the
   * request query params.
@@ -13,29 +16,38 @@ import scalaz.concurrent.Task
   */
 object UrlFormLifter {
 
-  def apply(service: HttpService, strictDecode: Boolean = false): HttpService =  Service.lift { req =>
+  def apply[F[_]: Sync, G[_]: Sync](f: G ~> F)(
+      @deprecatedName('service) http: Kleisli[F, Request[G], Response[G]],
+      strictDecode: Boolean = false): Kleisli[F, Request[G], Response[G]] =
+    Kleisli { req =>
+      def addUrlForm(form: UrlForm): F[Response[G]] = {
+        val flatForm = form.values.toVector.flatMap {
+          case (k, vs) => vs.toVector.map(v => (k, Some(v)))
+        }
+        val params = req.uri.query.toVector ++ flatForm: Vector[(String, Option[String])]
+        val newQuery = Query(params: _*)
 
-    def addUrlForm(form: UrlForm): Task[Response] = {
-      val flatForm = form.values.toVector.flatMap{ case (k, vs) => vs.map(v => (k,Some(v))) }
-      val params = req.uri.query.toVector ++ flatForm: Vector[(String, Option[String])]
-      val newQuery = Query(params :_*)
+        val newRequest = req
+          .withUri(req.uri.copy(query = newQuery))
+          .withEmptyBody
+        http(newRequest)
+      }
 
-      val newRequest = req.copy(uri = req.uri.copy(query = newQuery), body = EmptyBody)
-      service(newRequest)
+      req.headers.get(headers.`Content-Type`) match {
+        case Some(headers.`Content-Type`(MediaType.application.`x-www-form-urlencoded`, _))
+            if checkRequest(req) =>
+          for {
+            decoded <- f(UrlForm.entityDecoder[G].decode(req, strictDecode).value)
+            resp <- decoded.fold(
+              mf => f(mf.toHttpResponse[G](req.httpVersion)),
+              addUrlForm
+            )
+          } yield resp
+
+        case _ => http(req)
+      }
     }
 
-    req.headers.get(headers.`Content-Type`) match {
-      case Some(headers.`Content-Type`(MediaType.`application/x-www-form-urlencoded`,_)) if checkRequest(req) =>
-        UrlForm.entityDecoder
-          .decode(req, strictDecode)
-          .run
-          .flatMap(_.fold(_.toHttpResponse(req.httpVersion), addUrlForm))
-
-      case _ => service(req)
-    }
-  }
-
-  private def checkRequest(req: Request): Boolean = {
+  private def checkRequest[F[_]](req: Request[F]): Boolean =
     req.method == Method.POST || req.method == Method.PUT
-  }
 }

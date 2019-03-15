@@ -2,42 +2,60 @@ package org.http4s
 package server
 package middleware
 
+import cats.data.OptionT
+import cats.effect._
+import java.util.concurrent.TimeoutException
+import java.util.concurrent.atomic.AtomicBoolean
+import org.http4s.dsl.io._
+import org.http4s.Uri.uri
 import scala.concurrent.duration._
-import scalaz.concurrent.Task
-import Method._
 
 class TimeoutSpec extends Http4sSpec {
 
-  val myService = HttpService {
-    case req if req.uri.path == "/fast" => Response(Status.Ok).withBody("Fast")
-    case req if req.uri.path == "/slow" => Task(Thread.sleep(10000)).flatMap(_ => Response(Status.Ok).withBody("Slow"))
+  val routes = HttpRoutes.of[IO] {
+    case _ -> Root / "fast" =>
+      Ok("Fast")
+
+    case _ -> Root / "never" =>
+      IO.async[Response[IO]] { _ =>
+        ()
+      }
   }
 
-  val timeoutService = Timeout.apply(5.seconds)(myService)
-  val fastReq = Request(GET, uri("/fast"))
-  val slowReq = Request(GET, uri("/slow"))
+  val app = Timeout(5.milliseconds)(routes).orNotFound
+
+  val fastReq = Request[IO](GET, uri("/fast"))
+  val neverReq = Request[IO](GET, uri("/never"))
+
+  def checkStatus(resp: IO[Response[IO]], status: Status) =
+    resp.unsafeRunTimed(3.seconds).getOrElse(throw new TimeoutException) must haveStatus(status)
 
   "Timeout Middleware" should {
-    "Have no effect if the response is not delayed" in {
-
-      timeoutService.apply(fastReq).run.status must_== (Status.Ok)
+    "have no effect if the response is timely" in {
+      val app = Timeout(365.days)(routes).orNotFound
+      checkStatus(app(fastReq), Status.Ok)
     }
 
-    "return a 500 error if the result takes too long" in {
-      timeoutService.apply(slowReq).run.status must_== (Status.InternalServerError)
+    "return a 503 error if the result takes too long" in {
+      checkStatus(app(neverReq), Status.ServiceUnavailable)
     }
 
     "return the provided response if the result takes too long" in {
-      val customTimeout = Response(Status.GatewayTimeout) // some people return 504 here.
-      val altTimeoutService = Timeout(500.millis, Task.now(customTimeout))(myService)
-
-      altTimeoutService.apply(slowReq).run.status must_== (customTimeout.status)
+      val customTimeout = Response[IO](Status.GatewayTimeout) // some people return 504 here.
+      val altTimeoutService = Timeout(1.nanosecond, OptionT.pure[IO](customTimeout))(routes)
+      checkStatus(altTimeoutService.orNotFound(neverReq), customTimeout.status)
     }
 
-    "Handle infinite durations" in {
-      val service = Timeout(Duration.Inf)(myService)
-      service.apply(slowReq).run.status must_== (Status.Ok)
+    "cancel the loser" in {
+      val canceled = new AtomicBoolean(false)
+      val routes = HttpRoutes.of[IO] {
+        case _ =>
+          IO.never.guarantee(IO(canceled.set(true)))
+      }
+      val app = Timeout(1.millis)(routes).orNotFound
+      checkStatus(app(Request[IO]()), Status.ServiceUnavailable)
+      // Give the losing response enough time to finish
+      canceled.get must beTrue.eventually
     }
   }
-
 }

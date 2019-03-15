@@ -1,33 +1,48 @@
 package org.http4s
 
-import scalaz.Kleisli
-import scalaz.concurrent.Task
-import scalaz.syntax.kleisli._
+import cats._
+import cats.data._
+import cats.effect.Sync
+import cats.implicits._
 
+@deprecated("Deprecated in favor of Kleisli", "0.18")
 object Service {
-  /**
-    * Lifts an unwrapped function that returns a Task into a [[Service]].
-    *
-    * @see [[HttpService.apply]]
-    */
-  def lift[A, B](f: A => Task[B]): Service[A, B] = Kleisli.kleisli(f)
 
   /**
-    * Lifts a Task into a [[Service]].
+    * Lifts a total function to a `Service`. The function is expected to handle
+    * all requests it is given.  If `f` is a `PartialFunction`, use `apply`
+    * instead.
+    */
+  def lift[F[_], A, B](f: A => F[B]): Service[F, A, B] =
+    Kleisli(f)
+
+  /** Lifts a partial function to an `Service`.  Responds with the
+    * zero of [B] for any request where `pf` is not defined.
+    */
+  def apply[F[_], A, B: Monoid](pf: PartialFunction[A, F[B]])(
+      implicit F: Applicative[F]): Service[F, A, B] =
+    lift(req => pf.applyOrElse(req, Function.const(F.pure(Monoid[B].empty))))
+
+  /**
+    * Lifts a F into a [[Service]].
     *
     */
-  def const[A, B](b: => Task[B]): Service[A, B] = b.liftKleisli
+  def const[F[_], A, B](b: F[B]): Service[F, A, B] =
+    lift(_ => b)
 
   /**
     *  Lifts a value into a [[Service]].
     *
     */
-  def constVal[A, B](b: => B): Service[A, B] = Task.now(b).liftKleisli
+  def constVal[F[_], A, B](b: => B)(implicit F: Sync[F]): Service[F, A, B] =
+    lift(_ => F.delay(b))
 
-  /**
-    * Allows Service chainig through an implicit [[Fallthrough]] instance.
-    *
-    */
-  def withFallback[A, B : Fallthrough](fallback: Service[A, B])(service: Service[A, B]): Service[A, B] =
-    service.flatMap(resp => Fallthrough[B].fallthrough(resp, fallback))
+  /** Allows Service chaining through a Monoid instance. */
+  def withFallback[F[_], A, B](fallback: Service[F, A, B])(service: Service[F, A, B])(
+      implicit M: Semigroup[F[B]]): Service[F, A, B] =
+    service |+| fallback
+
+  /** A service that always returns the zero of B. */
+  def empty[F[_]: Sync, A, B: Monoid]: Service[F, A, B] =
+    constVal(Monoid[B].empty)
 }

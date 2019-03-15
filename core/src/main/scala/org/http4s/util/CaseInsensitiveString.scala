@@ -1,14 +1,27 @@
 package org.http4s.util
 
-import java.util.Locale
-import scalaz.syntax.Ops
+import cats.{Monoid, Order, Show}
 
-sealed class CaseInsensitiveString private (val value: String) extends CharSequence {
+/**
+  * A String wrapper such that two strings `x` and `y` are equal if
+  * `x.value.equalsIgnoreCase(y.value)`
+  */
+sealed class CaseInsensitiveString private (val value: String)
+    extends CharSequence
+    with Ordered[CaseInsensitiveString] {
   import CaseInsensitiveString._
 
-  private lazy val folded = value.toLowerCase(Locale.ROOT)
-
-  override def hashCode(): Int = folded.##
+  /* Lazily cache the hash code.  This is nearly identical to the
+   * hashCode of java.lang.String, but converting to lower case on
+   * the fly to avoid copying `value`'s character storage.
+   */
+  private[this] var hash = 0
+  override def hashCode(): Int = {
+    if (hash == 0) {
+      hash = hashLower(value)
+    }
+    hash
+  }
 
   override def equals(obj: Any): Boolean = obj match {
     case that: CaseInsensitiveString => value.equalsIgnoreCase(that.value)
@@ -17,23 +30,39 @@ sealed class CaseInsensitiveString private (val value: String) extends CharSeque
 
   override def toString: String = value
 
-  def length(): Int = value.length
+  override def charAt(n: Int): Char =
+    toString.charAt(n)
 
-  def charAt(index: Int): Char = value.charAt(index)
+  override def length(): Int =
+    value.length
 
-  def subSequence(start: Int, end: Int): CaseInsensitiveString = apply(value.subSequence(start, end))
+  override def subSequence(start: Int, end: Int): CaseInsensitiveString =
+    apply(value.subSequence(start, end))
+
+  override def compare(other: CaseInsensitiveString): Int =
+    value.compareToIgnoreCase(other.value)
 }
 
-object CaseInsensitiveString extends CaseInsensitiveStringSyntax {
-  def apply(cs: CharSequence) = new CaseInsensitiveString(cs.toString)
+object CaseInsensitiveString extends CaseInsensitiveStringInstances {
+  val empty: CaseInsensitiveString =
+    CaseInsensitiveString("")
+
+  def apply(cs: CharSequence): CaseInsensitiveString =
+    new CaseInsensitiveString(cs.toString)
 }
 
-final class CaseInsensitiveStringOps(val self: CharSequence) extends AnyVal {
-  def ci: CaseInsensitiveString = CaseInsensitiveString(self)
-}
+private[http4s] sealed trait CaseInsensitiveStringInstances {
+  implicit val http4sMonoidForCaseInsensitiveString: Monoid[CaseInsensitiveString] =
+    new Monoid[CaseInsensitiveString] {
+      override def empty = CaseInsensitiveString.empty
 
-trait CaseInsensitiveStringSyntax {
-  implicit def ToCaseInsensitiveStringSyntax(cs: CharSequence): CaseInsensitiveStringOps =
-    new CaseInsensitiveStringOps(cs)
-}
+      override def combine(x: CaseInsensitiveString, y: CaseInsensitiveString) =
+        CaseInsensitiveString(x.value + y.value)
+    }
 
+  implicit val http4sOrderForCaseInsensitiveString: Order[CaseInsensitiveString] =
+    Order.fromOrdering
+
+  implicit val http4sShowForCaseInsensitiveString: Show[CaseInsensitiveString] =
+    Show.fromToString
+}

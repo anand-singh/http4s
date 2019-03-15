@@ -1,10 +1,15 @@
-package org.http4s.server.staticcontent
+package org.http4s
+package server
+package staticcontent
 
-import org.http4s._
-import scalaz.concurrent.Task
-
+import cats.effect._
 
 /** Cache strategy that doesn't cache anything, ever. */
-object NoopCacheStrategy extends CacheStrategy {
-  override def cache(uriPath: String, resp: Response): Task[Response] = Task.now(resp)
+class NoopCacheStrategy[F[_]] extends CacheStrategy[F] {
+  override def cache(uriPath: String, resp: Response[F])(implicit F: Effect[F]): F[Response[F]] =
+    F.pure(resp)
+}
+
+object NoopCacheStrategy {
+  def apply[F[_]]: NoopCacheStrategy[F] = new NoopCacheStrategy[F]
 }

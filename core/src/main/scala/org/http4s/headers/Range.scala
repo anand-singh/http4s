@@ -1,19 +1,18 @@
 package org.http4s
 package headers
 
+import cats.data.NonEmptyList
 import org.http4s.parser.HttpHeaderParser
 import org.http4s.util.{Renderable, Writer}
-
-import org.http4s.util.NonEmptyList
 
 // See https://tools.ietf.org/html/rfc7233
 
 object Range extends HeaderKey.Internal[Range] with HeaderKey.Singleton {
 
   def apply(unit: RangeUnit, r1: SubRange, rs: SubRange*): Range =
-    Range(unit, NonEmptyList(r1, rs:_*))
+    Range(unit, NonEmptyList.of(r1, rs: _*))
 
-  def apply(r1: SubRange, rs: SubRange*): Range = apply(RangeUnit.Bytes, r1, rs:_*)
+  def apply(r1: SubRange, rs: SubRange*): Range = apply(RangeUnit.Bytes, r1, rs: _*)
 
   def apply(begin: Long, end: Long): Range = apply(SubRange(begin, Some(end)))
 
@@ -24,11 +23,12 @@ object Range extends HeaderKey.Internal[Range] with HeaderKey.Singleton {
     def apply(first: Long, second: Long): SubRange = SubRange(first, Some(second))
   }
 
-  case class SubRange(first: Long, second: Option[Long]) extends Renderable {
+  final case class SubRange(first: Long, second: Option[Long]) extends Renderable {
+
     /** Base method for rendering this object efficiently */
     override def render(writer: Writer): writer.type = {
       writer << first
-      second.foreach( writer << '-' << _ )
+      second.foreach(writer << '-' << _)
       writer
     }
   }
@@ -37,12 +37,12 @@ object Range extends HeaderKey.Internal[Range] with HeaderKey.Singleton {
     HttpHeaderParser.RANGE(s)
 }
 
-case class Range(unit: RangeUnit, ranges: NonEmptyList[Range.SubRange]) extends Header.Parsed {
-  override def key = Range
+final case class Range(unit: RangeUnit, ranges: NonEmptyList[Range.SubRange])
+    extends Header.Parsed {
+  override def key: Range.type = Range
   override def renderValue(writer: Writer): writer.type = {
     writer << unit << '=' << ranges.head
-    ranges.tail.foreach( writer << ',' << _)
+    ranges.tail.foreach(writer << ',' << _)
     writer
   }
 }
-
